@@ -19,8 +19,7 @@ except ImportError:
     sys.exit("请先安装依赖:  pip install requests")
 
 # ============================= 密钥配置 =============================
-# 本地运行: 在下方引号内填入密钥;  GitHub Actions: 留空, 用仓库Secrets(ECOS_KEY/DATA_GO_KR_KEY)
-ECOS_KEY = os.environ.get("ECOS_KEY") or ""          # 韩国银行ECOS (已填)
+ECOS_KEY = os.environ.get("ECOS_KEY") or "CYKDMCR9HNSZMQ8JBR50"          # 韩国银行ECOS (已填)
 DATA_GO_KR_KEY = os.environ.get("DATA_GO_KR_KEY") or ""                         # 公共数据门户通用密钥(Encoding/Decoding均可试), 留空则协会数据用ECOS月频
 # ===================================================================
 
@@ -30,6 +29,19 @@ YMD = TODAY.strftime("%Y%m%d")
 
 # 单位自校准锚点: 2026-06月末已知值(万亿韩元, 来自协会官网底稿)
 ANCHOR = {"yetak":121.6, "yungja":37.3, "jiya":25.5, "rp":108.8, "misu":1.3, "cma":110.5}
+
+
+# 合理区间(万亿韩元): 数量级校准的硬约束
+RANGE = {"mcap":(800,12000),"demand":(200,2000),"time":(400,3000),"hhloan":(600,2500),
+         "yetak":(5,400),"yungja":(1,120),"jiya":(1,120),"rp":(5,400),"misu":(0.05,20),"cma":(5,400)}
+def calibrate(key, raw_latest, unit_name):
+    """先按单位字段换算, 若落在合理区间直接用; 否则在10的幂里找能落区间的档位"""
+    lo,hi = RANGE.get(key,(0.01,20000))
+    base = unit_scale_by_name(unit_name)
+    if lo <= raw_latest*base <= hi: return base
+    for s in (1,0.1,0.01,1e-3,1e-4,1e-5,1e-6,1e-7,1e-8):
+        if lo <= raw_latest*s <= hi: return s
+    return None
 
 def unit_scale_by_name(u):
     u = u or ""
@@ -56,6 +68,8 @@ def ecos(path):
     j = r.json()
     res = j.get("RESULT")
     if res and res.get("CODE") not in (None,"INFO-000"):
+        if res.get("CODE")=="INFO-200":   # 区间内无数据 → 视为空
+            return {}
         raise RuntimeError(f"ECOS: {res.get('CODE')} {res.get('MESSAGE')}")
     return j
 
@@ -82,10 +96,15 @@ def fetch_mcap():
     print("· KOSPI总市值(日频, ECOS 802Y001)…", flush=True)
     items = ecos_items("802Y001")
     it = next((r for r in items if "시가총액" in (r.get("ITEM_NAME") or "") and "코스닥" not in (r.get("ITEM_NAME") or "")), None)
-    if not it: raise RuntimeError("802Y001 未找到市值项目")
-    sc = unit_scale_by_name(it.get("UNIT_NAME"))
+    if not it:
+        print("  项目清单:", [r.get("ITEM_NAME") for r in items][:30])
+        raise RuntimeError("802Y001 未找到市值项目(清单已打印)")
     pairs = rows_to_pairs(ecos_series("802Y001","D",it["ITEM_CODE"],"19950103",YMD))
-    if not pairs: raise RuntimeError("市值序列为空")
+    if not pairs:
+        pairs = rows_to_pairs(ecos_series("802Y001","D",it["ITEM_CODE"],"20200102",YMD))
+    if not pairs: raise RuntimeError(f"市值序列为空(项目:{it.get('ITEM_NAME')} 代码:{it.get('ITEM_CODE')})")
+    sc = calibrate("mcap", pairs[-1][1], it.get("UNIT_NAME"))
+    if sc is None: raise RuntimeError(f"市值数量级异常: 原始最新值={pairs[-1][1]} 单位={it.get('UNIT_NAME')}")
     d=[p[0] for p in pairs]; v=[round(p[1]*sc,1) for p in pairs]
     print(f"  ✓ {len(d)}个交易日 ({d[0]} ~ {d[-1]}), 最新 {v[-1]:,.0f} 万亿 (原始单位:{it.get('UNIT_NAME')})")
     return {"d":d,"v":v,"f":"D","src":f"ECOS 802Y001·{it.get('ITEM_NAME','')}"}
@@ -97,9 +116,13 @@ def fetch_deposits():
         print(f"· {label}(月频, ECOS 104Y015)…", flush=True)
         cands=[r for r in items if kw in (r.get("ITEM_NAME") or "")]
         cands.sort(key=lambda r: len(r.get("ITEM_NAME") or ""))
-        if not cands: print(f"  ✗ 未找到「{kw}」项目"); continue
-        it=cands[0]; sc=unit_scale_by_name(it.get("UNIT_NAME"))
+        if not cands:
+            print(f"  ✗ 未找到「{kw}」· 该表项目清单:", [r.get("ITEM_NAME") for r in items][:30]); continue
+        it=cands[0]
         pairs=rows_to_pairs(ecos_series("104Y015","M",it["ITEM_CODE"],"199001",YM))
+        if not pairs: print(f"  ✗ {label}空序列"); continue
+        sc=calibrate(key, pairs[-1][1], it.get("UNIT_NAME"))
+        if sc is None: print(f"  ✗ {label}数量级异常 原始={pairs[-1][1]} 单位={it.get('UNIT_NAME')}"); continue
         d=[p[0] for p in pairs]; v=[round(p[1]*sc,2) for p in pairs]
         print(f"  ✓ {len(d)}个月 ({d[0]} ~ {d[-1]}), 最新 {v[-1]:,.1f} 万亿 · 项目:{it.get('ITEM_NAME')}")
         out[key]={"d":d,"v":v,"f":"M","src":f"ECOS 104Y015·{it.get('ITEM_NAME','')}"}
@@ -117,8 +140,8 @@ def fetch_funds_ecos():
             pairs=rows_to_pairs(ecos_series("901Y056","M",it["ITEM_CODE"],"197501",YM))
         except Exception: continue
         if not pairs: continue
-        raw_latest=pairs[-1][1]
-        sc=snap_scale(raw_latest,ANCHOR.get(key,100)) or unit_scale_by_name(it.get("UNIT_NAME"))
+        sc=calibrate(key, pairs[-1][1], it.get("UNIT_NAME"))
+        if sc is None: continue
         d=[p[0] for p in pairs]; v=[round(p[1]*sc,2) for p in pairs]
         out[key]={"d":d,"v":v,"f":"M","src":f"ECOS 901Y056·{it.get('ITEM_NAME','')}"}
         print(f"  ✓ {key}: {len(d)}月 ({d[0]}~{d[-1]}), 最新 {v[-1]:,.1f} 万亿")
@@ -130,14 +153,14 @@ def fetch_hhloan():
     items = ecos_items("104Y016")
     cands=[r for r in items if "가계" in (r.get("ITEM_NAME") or "")]
     cands.sort(key=lambda r: len(r.get("ITEM_NAME") or ""))
-    if not cands: print("  ✗ 104Y016未找到가계대출项目"); return {}
-    it=cands[0]; sc=unit_scale_by_name(it.get("UNIT_NAME"))
+    if not cands:
+        print("  ✗ 104Y016未找到가계项目 · 项目清单:", [r.get("ITEM_NAME") for r in items][:30]); return {}
+    it=cands[0]
     pairs=rows_to_pairs(ecos_series("104Y016","M",it["ITEM_CODE"],"199001",YM))
-    if not pairs: return {}
+    if not pairs: print("  ✗ 家庭贷款空序列"); return {}
+    sc=calibrate("hhloan", pairs[-1][1], it.get("UNIT_NAME"))
+    if sc is None: print(f"  ✗ 家庭贷款数量级异常 原始={pairs[-1][1]} 单位={it.get('UNIT_NAME')}"); return {}
     d=[p[0] for p in pairs]; v=[round(p[1]*sc,1) for p in pairs]
-    if not (500 < v[-1] < 3000):
-        alt=snap_scale(pairs[-1][1],1189)
-        if alt: v=[round(p[1]*alt,1) for p in pairs]
     print(f"  ✓ {len(d)}个月 ({d[0]}~{d[-1]}), 最新 {v[-1]:,.1f} 万亿 · 项目:{it.get('ITEM_NAME')}")
     return {"hhloan":{"d":d,"v":v,"f":"M","src":f"ECOS 104Y016·{it.get('ITEM_NAME','')}"}}
 
@@ -257,6 +280,13 @@ def main():
     except Exception as e: print(f"  ✗ ECOS协会月频失败: {e}")
     out["funds"]=funds
 
+    print("\n========== 序列体检报告 ==========")
+    def rep(k,v):
+        if v and v.get("d"): print(f"  {k:8s} {v['f']} {len(v['d']):>6}点  {v['d'][0]} ~ {v['d'][-1]}  最新={v['v'][-1]:,}")
+        else: print(f"  {k:8s} 缺失")
+    rep("mcap",out.get("mcap")); rep("demand",out.get("demand")); rep("time",out.get("time")); rep("hhloan",out.get("hhloan"))
+    for k in ("yetak","yungja","jiya","rp","misu","cma"): rep(k,(out.get("funds") or {}).get(k))
+    print("==================================\n")
     with open("data.js","w",encoding="utf-8") as f:
         f.write("window.KOREA_DATA=");json.dump(out,f,ensure_ascii=False,separators=(",",":"));f.write(";")
     with open("data_backup.json","w",encoding="utf-8") as f:
