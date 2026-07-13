@@ -36,7 +36,7 @@ ANCHOR = {"yetak":121.6, "yungja":37.3, "jiya":25.5, "rp":108.8, "misu":1.3, "cm
 
 
 # 合理区间(万亿韩元): 数量级校准的硬约束
-RANGE = {"mcap":(800,12000),"demand":(200,2000),"time":(400,3000),"hhloan":(600,2500),
+RANGE = {"mcap":(800,12000),"demand":(200,2000),"time":(400,3000),"hhloan":(600,2500),"otherloan":(80,1200),
          "yetak":(5,400),"yungja":(1,120),"jiya":(1,120),"rp":(5,400),"misu":(0.05,20),"cma":(5,400)}
 def calibrate(key, raw_latest, unit_name):
     """先按单位字段换算, 若落在合理区间直接用; 否则在10的幂里找能落区间的档位"""
@@ -209,7 +209,45 @@ def fetch_hhloan():
     if sc is None: dbg(f"家庭贷款数量级异常 原始={pairs[-1][1]} 单位={unit}"); return {}
     d=[p[0] for p in pairs]; v=[round(p[1]*sc,1) for p in pairs]
     print(f"  ✓ {len(d)}个月 ({d[0]}~{d[-1]}), 最新 {v[-1]:,.1f} 万亿 · 예금은행·{nm}")
-    return {"hhloan":{"d":d,"v":v,"f":"M","src":"ECOS 151Y002·예금은행 가계대출(말잔)"}}
+    out = {"hhloan":{"d":d,"v":v,"f":"M","src":"ECOS 151Y002·예금은행 가계대출(말잔)"}}
+    out.update(fetch_otherloan())
+    return out
+
+def fetch_otherloan():
+    print("· 其他贷款/기타대출(BOK月度, ECOS 151Y005 용도별)…", flush=True)
+    rows = ecos_series_all("151Y005","M","200001",YM)
+    if not rows: dbg("151Y005整表为空"); return {}
+    n1 = sorted({(r.get("ITEM_NAME1") or "") for r in rows})
+    n2 = sorted({(r.get("ITEM_NAME2") or "") for r in rows})
+    dbg(f"151Y005维度 ITEM1={n1[:12]} ITEM2={n2[:12]}")
+    def pick(names, kws):
+        return next((n for n in names if any(k in n for k in kws)), None)
+    # 找"其他贷款"所在维度; 机构维度若存在优先예금은행
+    tgt1_other = pick(n1, ["기타"]); tgt2_other = pick(n2, ["기타"])
+    bank1 = pick(n1, ["예금은행"]); bank2 = pick(n2, ["예금은행"])
+    tmp={}
+    for r in rows:
+        a,b = (r.get("ITEM_NAME1") or ""), (r.get("ITEM_NAME2") or "")
+        if tgt1_other and a!=tgt1_other: continue
+        if tgt2_other and b!=tgt2_other: continue
+        if not (tgt1_other or tgt2_other): continue
+        if bank1 and tgt1_other!=bank1 and pick([a],["예금은행"]) is None and bank1 in n1 and tgt2_other: 
+            if a!=bank1: continue
+        if bank2 and tgt1_other and b and bank2 in n2:
+            if b!=bank2: continue
+        t, val = r.get("TIME",""), r.get("DATA_VALUE")
+        try: val=float(val)
+        except (TypeError,ValueError): continue
+        if len(t)>=6: tmp[f"{t[:4]}-{t[4:6]}"]=val
+    if not tmp:
+        dbg("151Y005未定位到기타대출行"); return {}
+    pairs=sorted(tmp.items())
+    unit = rows[0].get("UNIT_NAME")
+    sc = calibrate("otherloan", pairs[-1][1], unit)
+    if sc is None: dbg(f"其他贷款数量级异常 原始={pairs[-1][1]} 单位={unit}"); return {}
+    d=[p[0] for p in pairs]; v=[round(p[1]*sc,1) for p in pairs]
+    print(f"  ✓ {len(d)}个月 ({d[0]}~{d[-1]}), 最新 {v[-1]:,.1f} 万亿")
+    return {"otherloan":{"d":d,"v":v,"f":"M","src":"ECOS 151Y005·기타대출"}}
 
 # ---------------------------- data.go.kr 协会日频 ----------------------------
 G = "https://apis.data.go.kr/1160100/service/GetKofiaStatisticsInfoService"
@@ -387,7 +425,7 @@ def main():
     def rep(k,v):
         if v and v.get("d"): print(f"  {k:8s} {v['f']} {len(v['d']):>6}点  {v['d'][0]} ~ {v['d'][-1]}  最新={v['v'][-1]:,}")
         else: print(f"  {k:8s} 缺失")
-    rep("mcap",out.get("mcap")); rep("demand",out.get("demand")); rep("time",out.get("time")); rep("hhloan",out.get("hhloan"))
+    rep("mcap",out.get("mcap")); rep("demand",out.get("demand")); rep("time",out.get("time")); rep("hhloan",out.get("hhloan")); rep("otherloan",out.get("otherloan"))
     for k in ("yetak","yungja","jiya","rp","misu","cma","forced"): rep(k,(out.get("funds") or {}).get(k))
     print("==================================\n")
     with open("data.js","w",encoding="utf-8") as f:
