@@ -43,7 +43,7 @@ def calibrate(key, raw_latest, unit_name):
     lo,hi = RANGE.get(key,(0.01,20000))
     base = unit_scale_by_name(unit_name)
     if lo <= raw_latest*base <= hi: return base
-    for s in (1,0.1,0.01,1e-3,1e-4,1e-5,1e-6,1e-7,1e-8):
+    for s in (1,0.1,0.01,1e-3,1e-4,1e-5,1e-6,1e-7,1e-8,1e-9,1e-10,1e-11,1e-12,1e-13):
         if lo <= raw_latest*s <= hi: return s
     return None
 
@@ -54,13 +54,14 @@ def unit_scale_by_name(u):
     if "십억" in u: return 1e-3
     if "백만" in u: return 1e-6
     if "억" in u: return 1e-4
+    if u.strip()=="원": return 1e-12
     return 1e-3
 
 def snap_scale(raw_latest, anchor):
     """在10的幂中选使 raw*scale ≈ anchor 的档位"""
     if not raw_latest or raw_latest <= 0: return None
     best, bd = None, 9e9
-    for s in (1,0.1,0.01,1e-3,1e-4,1e-5,1e-6,1e-7):
+    for s in (1,0.1,0.01,1e-3,1e-4,1e-5,1e-6,1e-7,1e-8,1e-9,1e-10,1e-11,1e-12,1e-13):
         d = abs(math.log10(raw_latest*s) - math.log10(anchor))
         if d < bd: bd, best = d, s
     return best if bd < 0.5 else None   # 偏离超过~3倍则放弃校准
@@ -186,39 +187,36 @@ def fetch_funds_ecos():
 
 def fetch_hhloan():
     print("· 家庭贷款(BOK月度, ECOS 151Y002 예금취급기관 가계대출)…", flush=True)
-    items = ecos_items("151Y002")
-    it = None
-    if items:
-        dbg("151Y002清单: "+", ".join((r.get("ITEM_NAME") or "?") for r in items[:25]))
-        it = next((r for r in items if "예금은행" in (r.get("ITEM_NAME") or "")), None)
-        if it is None:
-            cands=[r for r in items if "가계" in (r.get("ITEM_NAME") or "") or "합계" in (r.get("ITEM_NAME") or "")]
-            cands.sort(key=lambda r: len(r.get("ITEM_NAME") or ""))
-            it = cands[0] if cands else items[0]
-    if it is not None:
-        pairs = rows_to_pairs(ecos_series("151Y002","M",it["ITEM_CODE"],"200001",YM))
-        unit = it.get("UNIT_NAME")
-        name = it.get("ITEM_NAME","")
-    else:
-        rows = [r for r in ecos_series_all("151Y002","M","200001",YM) if "예금은행" in (r.get("ITEM_NAME1") or "")]
-        pairs = rows_to_pairs(rows); unit = rows[0].get("UNIT_NAME") if rows else ""
-        name = rows[0].get("ITEM_NAME1","整表兜底") if rows else ""
-    if not pairs: dbg("151Y002 家庭贷款空序列"); return {}
-    sc = calibrate("hhloan", pairs[-1][1], unit)
+    rows = [r for r in ecos_series_all("151Y002","M","200001",YM) if "예금은행" in (r.get("ITEM_NAME1") or "")]
+    if not rows: dbg("151Y002 整表无예금은행行"); return {}
+    groups={}
+    for r in rows:
+        nm = (r.get("ITEM_NAME2") or r.get("ITEM_NAME1") or "합계").strip()
+        t, v = r.get("TIME",""), r.get("DATA_VALUE")
+        try: v=float(v)
+        except (TypeError,ValueError): continue
+        if len(t)>=6: groups.setdefault(nm,{})[f"{t[:4]}-{t[4:6]}"]=(v, r.get("UNIT_NAME"))
+    if not groups: dbg("151Y002 分组为空"); return {}
+    # 选最新值最大的组 = 家庭贷款总额(总额>住房抵押>其他)
+    best=None
+    for nm,mp in groups.items():
+        last_ym=max(mp); lv=mp[last_ym][0]
+        dbg(f"151Y002 예금은행·{nm}: 最新原始值={lv}")
+        if best is None or lv>best[2]: best=(nm,mp,lv)
+    nm,mp,_=best
+    pairs=sorted((k,v[0]) for k,v in mp.items()); unit=next(iter(mp.values()))[1]
+    sc=calibrate("hhloan", pairs[-1][1], unit)
     if sc is None: dbg(f"家庭贷款数量级异常 原始={pairs[-1][1]} 单位={unit}"); return {}
     d=[p[0] for p in pairs]; v=[round(p[1]*sc,1) for p in pairs]
-    print(f"  ✓ {len(d)}个月 ({d[0]}~{d[-1]}), 最新 {v[-1]:,.1f} 万亿 · 项目:{name}")
-    return {"hhloan":{"d":d,"v":v,"f":"M","src":f"ECOS 151Y002·{name}"}}
+    print(f"  ✓ {len(d)}个月 ({d[0]}~{d[-1]}), 最新 {v[-1]:,.1f} 万亿 · 예금은행·{nm}")
+    return {"hhloan":{"d":d,"v":v,"f":"M","src":f"ECOS 151Y002·예금은행 {nm}"}}
 
 # ---------------------------- data.go.kr 协会日频 ----------------------------
 G = "https://apis.data.go.kr/1160100/service/GetKofiaStatisticsInfoService"
-OP_CANDS = {  # 官方仅公开①getTrustScaleInfo, 其余按命名惯例探测
-  "fund":  ["getStockMktFundTrendInfo","getScrtsMktFundTrendInfo","getStockMarketFundTrendInfo",
-            "getStmkFundTrendInfo","getSecuritiesFundTrendInfo","getStockFundTrendInfo"],
-  "credit":["getCrdtGrantBlceTrendInfo","getCrdtGrantBalanceTrendInfo","getCreditGrantBalanceInfo",
-            "getCrdtOfrBlceTrendInfo","getCrdtBlceTrendInfo","getCreditBalanceTrendInfo"],
-  "cma":   ["getDailyCmaSttusInfo","getDayByCmaSttusInfo","getCmaDailySttusInfo",
-            "getDailyCmaInfo","getCmaSttusInfo"],
+OP_CANDS = {  # 官方Swagger确认的真实操作名
+  "fund":  ["getSecuritiesMarketTotalCapitalInfo"],   # 증시자금추이(日频): 预托金/RP/垫付欠款
+  "credit":["getGrantingOfCreditBalanceInfo"],        # 신용공여잔고추이(日频): 融资/质押
+  "cma":   ["getCMAStatus"],                          # 일자별CMA현황(日频)
 }
 def gk(op, page=1, rows=5000):
     r = requests.get(f"{G}/{op}", params={"serviceKey":DATA_GO_KR_KEY,"pageNo":page,
@@ -276,7 +274,8 @@ def series_from_items(items, val_kws, anchor_key):
     for k in items[0].keys():
         lk=k.lower()
         if any(w in lk for w in val_kws): fld=k; break
-    if not fld: return None
+    if not fld:
+        dbg(f"字段嗅探失败({anchor_key}): 可用字段={list(items[0].keys())}"); return None
     tmp={}
     for it in items:
         s=str(it.get(df,"")); 
@@ -297,15 +296,15 @@ def fetch_funds_daily():
     if op:
         items=pull_all(op,total)
         if items: print(f"  字段样例(증시자금): {list(items[0].keys())}")
-        for key,kws in (("yetak",["dpsg","depo","yetak","invr"]),("rp",["rp","repo","환매"]),
-                        ("misu",["msu","misu","outsta","uncl"])):
+        for key,kws in (("yetak",["dpsg","dpst","depo","invst","ivst","yetak"]),("rp",["rp","repo"]),
+                        ("misu",["msu","misu","rcvbl","uncl","outsta"])):
             s=series_from_items(items,kws,key)
             if s: out[key]=s; print(f"  ✓ {key} 日频 {len(s['d'])}点 最新{s['v'][-1]:,.1f}万亿")
     op,total=probe("credit")
     if op:
         items=pull_all(op,total)
         if items: print(f"  字段样例(신용공여): {list(items[0].keys())}")
-        for key,kws in (("yungja",["crdt","loan","fnc","yungja","융자"]),("jiya",["scty","secu","pledge","담보","mrtg"])):
+        for key,kws in (("yungja",["fnc","loan","crdt"]),("jiya",["scrt","scty","secu","pledge","mrtg","cltr"])):
             s=series_from_items(items,kws,key)
             if s: out[key]=s; print(f"  ✓ {key} 日频 {len(s['d'])}点 最新{s['v'][-1]:,.1f}万亿")
     op,total=probe("cma")
