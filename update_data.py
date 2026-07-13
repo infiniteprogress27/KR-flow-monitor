@@ -209,7 +209,7 @@ def fetch_hhloan():
     if sc is None: dbg(f"家庭贷款数量级异常 原始={pairs[-1][1]} 单位={unit}"); return {}
     d=[p[0] for p in pairs]; v=[round(p[1]*sc,1) for p in pairs]
     print(f"  ✓ {len(d)}个月 ({d[0]}~{d[-1]}), 最新 {v[-1]:,.1f} 万亿 · 예금은행·{nm}")
-    return {"hhloan":{"d":d,"v":v,"f":"M","src":f"ECOS 151Y002·예금은행 {nm}"}}
+    return {"hhloan":{"d":d,"v":v,"f":"M","src":"ECOS 151Y002·예금은행 가계대출(말잔)"}}
 
 # ---------------------------- data.go.kr 协会日频 ----------------------------
 G = "https://apis.data.go.kr/1160100/service/GetKofiaStatisticsInfoService"
@@ -296,10 +296,29 @@ def fetch_funds_daily():
     if op:
         items=pull_all(op,total)
         if items: print(f"  字段样例(증시자금): {list(items[0].keys())}")
-        for key,kws in (("yetak",["dpsg","dpst","depo","invst","ivst","yetak"]),("rp",["rp","repo"]),
-                        ("misu",["msu","misu","rcvbl","uncl","outsta"])):
+        for key,kws in (("yetak",["dpsg","dpst","depo","invst","ivst"]),("rp",["rp","repo"]),
+                        ("misu",["ucolmny","ucol","msu","misu"])):
             s=series_from_items(items,kws,key)
             if s: out[key]=s; print(f"  ✓ {key} 日频 {len(s['d'])}点 最新{s['v'][-1]:,.1f}万亿")
+        # 强平/垫付比重: 接口原生比率字段(RlImpt), 不做万亿换算
+        if items:
+            df=date_field(items[0])
+            fld=next((k for k in items[0] if "rlimpt" in k.lower()),None)
+            if df and fld:
+                tmp={}
+                for it2 in items:
+                    t=str(it2.get(df,""))
+                    try: v=float(str(it2.get(fld,"")).replace(",",""))
+                    except ValueError: continue
+                    if len(t)==8: tmp[f"{t[:4]}-{t[4:6]}-{t[6:8]}"]=v
+                if tmp:
+                    dd=sorted(tmp); vv=[tmp[x] for x in dd]
+                    med=sorted(vv)[len(vv)//2]
+                    if med<1: vv=[round(x*100,2) for x in vv]   # 小数比率→百分比
+                    if 0.05<sorted(vv)[len(vv)//2]<60:
+                        out["forced"]={"d":dd,"v":[round(x,2) for x in vv],"f":"D","src":f"data.go.kr 협회·{fld}"}
+                        print(f"  ✓ forced 日频 {len(dd)}点 最新{vv[-1]:.1f}%")
+                    else: dbg(f"forced 比率量级异常 中位数={sorted(vv)[len(vv)//2]}")
     op,total=probe("credit")
     if op:
         items=pull_all(op,total)
@@ -310,9 +329,35 @@ def fetch_funds_daily():
     op,total=probe("cma")
     if op:
         items=pull_all(op,total)
-        if items: print(f"  字段样例(CMA): {list(items[0].keys())}")
-        s=series_from_items(items,["tot","sum","hapg","합계","blce","amt"],"cma")
-        if s: out["cma"]=s; print(f"  ✓ cma 日频 {len(s['d'])}点 最新{s['v'][-1]:,.1f}万亿")
+        if items:
+            tgts=sorted({str(it2.get("mngInvTgt","")) for it2 in items})
+            ctgs=sorted({str(it2.get("invrCtg","")) for it2 in items})
+            dbg(f"CMA维度 운용대상={tgts} 투자자구분={ctgs}")
+            tot_tgt=next((t for t in tgts if any(w in t for w in ("합계","전체","계"))),None)
+            tot_ctg=next((c for c in ctgs if any(w in c for w in ("합계","전체","계"))),None)
+            tmp={}
+            for it2 in items:
+                t=str(it2.get("basDt",""))
+                if len(t)!=8: continue
+                if tot_tgt and str(it2.get("mngInvTgt",""))!=tot_tgt: continue
+                if tot_ctg and str(it2.get("invrCtg",""))!=tot_ctg: continue
+                try: v=float(str(it2.get("actBal","")).replace(",",""))
+                except ValueError: continue
+                key2=f"{t[:4]}-{t[4:6]}-{t[6:8]}"
+                tmp[key2]=tmp.get(key2,0.0)+v
+            if tmp:
+                dd=sorted(tmp); raw=[tmp[x] for x in dd]
+                sc=calibrate("cma",raw[-1],"원")
+                if sc:
+                    vv=[round(x*sc,2) for x in raw]
+                    # 锚点验证: 2026-06月末应≈110.5
+                    junes=[i for i,x in enumerate(dd) if x.startswith("2026-06")]
+                    ok = (not junes) or abs(vv[junes[-1]]-110.5)/110.5<0.2
+                    if ok:
+                        out["cma"]={"d":dd,"v":vv,"f":"D","src":"data.go.kr 협회·actBal聚合"}
+                        print(f"  ✓ cma 日频 {len(dd)}点 最新{vv[-1]:,.1f}万亿")
+                    else: dbg(f"CMA锚点验证失败: 2026-06末={vv[junes[-1]]} vs 底稿110.5")
+                else: dbg(f"CMA数量级异常 原始最新={raw[-1]}")
     if not out:
         print("  ✗ 日频探测失败(操作名未命中或密钥未审批)。请打开数据集页面→상세기능(Swagger)查看真实操作名,")
         print("    替换脚本顶部 OP_CANDS 中对应候选列表首位后重跑: https://www.data.go.kr/data/15094809/openapi.do")
@@ -343,7 +388,7 @@ def main():
         if v and v.get("d"): print(f"  {k:8s} {v['f']} {len(v['d']):>6}点  {v['d'][0]} ~ {v['d'][-1]}  最新={v['v'][-1]:,}")
         else: print(f"  {k:8s} 缺失")
     rep("mcap",out.get("mcap")); rep("demand",out.get("demand")); rep("time",out.get("time")); rep("hhloan",out.get("hhloan"))
-    for k in ("yetak","yungja","jiya","rp","misu","cma"): rep(k,(out.get("funds") or {}).get(k))
+    for k in ("yetak","yungja","jiya","rp","misu","cma","forced"): rep(k,(out.get("funds") or {}).get(k))
     print("==================================\n")
     with open("data.js","w",encoding="utf-8") as f:
         f.write("window.KOREA_DATA=");json.dump(out,f,ensure_ascii=False,separators=(",",":"));f.write(";")
