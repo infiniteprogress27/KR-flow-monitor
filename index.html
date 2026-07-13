@@ -79,6 +79,7 @@ button:disabled{background:#B9C2D0;cursor:wait}
   <tr><td>活期 / 定期·储蓄性存款</td><td>ECOS 104Y015「存款银行韩元存款（按种类·月末余额）」· 月频 · 1990年起</td></tr>
   <tr><td>KOSPI总市值</td><td>ECOS 802Y001（日频，近两年逐日）＋ 901Y014（月频，全历史）拼接 · 交易所源 · 比率按当月最后交易日对齐</td></tr>
   <tr><td>预托金/融资/回购/垫付欠款/CMA</td><td>内置协会官网底稿（2000-01～2026-06）＋ ECOS 901Y056「股市周边资金动向」增量自动补新</td></tr>
+  <tr><td>其他贷款（BOK月度）</td><td>ECOS 151Y005「存款受理机构家庭贷款（按用途·月末余额）」其他贷款项＝非抵押部分（信用贷/负存折等빚투主通道）· 月频 · 与03B之差即住房抵押贷款</td></tr>
   <tr><td>家庭贷款（BOK月度）</td><td>ECOS 104Y016「存款银行贷款（月末余额）」家庭贷款项 · 月频 · 与季度家庭信用互为月度先行/季度定盘关系</td></tr>
   <tr><td>股票质押 / 强平比例 / 家庭信用</td><td>内置底稿（协会FreeSIS与韩银无对应开放接口项 / 季频），更新需官网下载</td></tr>
  </table>
@@ -100,7 +101,7 @@ function initFromRaw(){
     SER[k]={d,v,f:'M',src:'内置底稿·协会官网'};
   });
   SER.hh={d:RAW.hh.dates.slice(),v:RAW.hh.vals.slice(),f:'Q',src:'内置底稿·韩银'};
-  SER.demand=null;SER.time=null;SER.hhloan=null;
+  SER.demand=null;SER.time=null;SER.hhloan=null;SER.otherloan=null;
 }
 function applyExternal(){
   const X=window.KOREA_DATA; if(!X) return false;
@@ -109,7 +110,7 @@ function applyExternal(){
     X.mcap.d.forEach((dt,i)=>{MCAP_M[dt.slice(0,7)]=X.mcap.v[i]});
     MCAP={date:X.mcap.d[X.mcap.d.length-1],val:X.mcap.v[X.mcap.v.length-1]};
   }
-  ['demand','time','hhloan'].forEach(k=>{if(X[k]&&X[k].d&&X[k].d.length)SER[k]=X[k]});
+  ['demand','time','hhloan','otherloan'].forEach(k=>{if(X[k]&&X[k].d&&X[k].d.length)SER[k]=X[k]});
   if(X.funds)Object.keys(X.funds).forEach(k=>{const s=X.funds[k];
     if(s&&s.d&&s.d.length&&(s.f==='D'||!SER[k]||s.d.length>=SER[k].d.length))SER[k]=s});
   return true;
@@ -147,6 +148,7 @@ const S=[
  {no:2,key:'time',title:'定期 / 储蓄性存款'},
  {no:3,key:'hh',title:'家庭信用贷款总额（季度·最广口径）'},
  {no:'3B',key:'hhloan',title:'家庭贷款（存款银行·BOK月度）'},
+ {no:'3C',key:'otherloan',title:'其他贷款（기타대출·非抵押·BOK月度）'},
  {no:4,key:'yetak',title:'客户保证金存款（预托金）'},
  {no:5,key:'cma',title:'CMA账户总余额'},
  {no:6,key:'rp',title:'券商对客户回购余额'},
@@ -159,6 +161,7 @@ const freqLabel=f=>f==='D'?'日频':f==='Q'?'季频':'月频';
 
 /* ================= 图表 ================= */
 let charts={};
+const tick=v=>{v=Number(v);v=parseFloat(v.toPrecision(12));return Math.abs(v)>=1000?v.toLocaleString('zh-CN'):String(v)};
 const axFont={font:{family:mono,size:11},color:'#5E6D86'};
 function mkChart(id,cfg){if(charts[id])charts[id].destroy();charts[id]=new Chart(document.getElementById(id),cfg)}
 function dualChart(id,labels,lv,yy,color){
@@ -169,15 +172,15 @@ function dualChart(id,labels,lv,yy,color){
    plugins:{legend:{display:true,labels:{boxWidth:16,boxHeight:2,font:{size:11},color:'#5E6D86'}},
     tooltip:{titleFont:{family:mono},bodyFont:{family:mono},callbacks:{label:c=>c.dataset.label.includes('YoY')?` YoY ${c.parsed.y==null?'—':c.parsed.y.toFixed(1)+'%'}`:` 总额 ${fmt(c.parsed.y)} 万亿`}}},
    scales:{x:{ticks:{...axFont,maxTicksLimit:10,autoSkip:true},grid:{display:false}},
-    y:{position:'left',ticks:{...axFont,callback:v=>Number(v).toLocaleString('zh-CN')},grid:{color:'#E9EEF5'}},
-    y1:{position:'right',ticks:{...axFont,callback:v=>v+'%'},grid:{display:false}}}}});
+    y:{position:'left',ticks:{...axFont,callback:v=>tick(v)},grid:{color:'#E9EEF5'}},
+    y1:{position:'right',ticks:{...axFont,callback:v=>tick(v)+'%'},grid:{display:false}}}}});
 }
 function ratioChart(id,labels,vals){
   mkChart(id,{type:'line',data:{labels,datasets:[{data:vals,borderColor:'#A8721C',backgroundColor:'rgba(168,114,28,.08)',fill:true,borderWidth:1.6,pointRadius:0,spanGaps:true}]},
   options:{responsive:true,maintainAspectRatio:false,animation:false,
    plugins:{legend:{display:false},tooltip:{titleFont:{family:mono},bodyFont:{family:mono},callbacks:{label:c=>` 占市值 ${c.parsed.y==null?'—':c.parsed.y.toFixed(2)+'%'}`}}},
    scales:{x:{ticks:{...axFont,maxTicksLimit:10,autoSkip:true},grid:{display:false}},
-    y:{ticks:{...axFont,callback:v=>v+'%'},grid:{color:'#E9EEF5'}}}}});
+    y:{ticks:{...axFont,callback:v=>tick(v)+'%'},grid:{color:'#E9EEF5'}}}}});
 }
 
 /* ================= 渲染 ================= */
@@ -225,7 +228,7 @@ function renderForced(){
   mkChart('ch-forced',{type:'bar',data:{labels:d.d,datasets:[{data:d.v,backgroundColor:'#A8721C'}]},
    options:{responsive:true,maintainAspectRatio:false,animation:false,
     plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>` ${c.parsed.y==null?'—':c.parsed.y.toFixed(1)+'%'}`}}},
-    scales:{x:{ticks:{...axFont,maxTicksLimit:10,autoSkip:true},grid:{display:false}},y:{ticks:{...axFont,callback:v=>v+'%'},grid:{color:'#E9EEF5'}}}}});
+    scales:{x:{ticks:{...axFont,maxTicksLimit:10,autoSkip:true},grid:{display:false}},y:{ticks:{...axFont,callback:v=>tick(v)+'%'},grid:{color:'#E9EEF5'}}}}});
 }
 function buildTape(){
   const items=[['融资','yungja'],['股票质押','jiya'],['预托金','yetak'],['CMA','cma'],['对客回购','rp'],['KOSPI市值','__m']];
