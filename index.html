@@ -169,7 +169,7 @@ function dualChart(id,labels,lv,yy,color){
    plugins:{legend:{display:true,labels:{boxWidth:16,boxHeight:2,font:{size:11},color:'#5E6D86'}},
     tooltip:{titleFont:{family:mono},bodyFont:{family:mono},callbacks:{label:c=>c.dataset.label.includes('YoY')?` YoY ${c.parsed.y==null?'—':c.parsed.y.toFixed(1)+'%'}`:` 总额 ${fmt(c.parsed.y)} 万亿`}}},
    scales:{x:{ticks:{...axFont,maxTicksLimit:10,autoSkip:true},grid:{display:false}},
-    y:{position:'left',ticks:axFont,grid:{color:'#E9EEF5'}},
+    y:{position:'left',ticks:{...axFont,callback:v=>Number(v).toLocaleString('zh-CN')},grid:{color:'#E9EEF5'}},
     y1:{position:'right',ticks:{...axFont,callback:v=>v+'%'},grid:{display:false}}}}});
 }
 function ratioChart(id,labels,vals){
