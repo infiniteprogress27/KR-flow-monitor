@@ -23,6 +23,10 @@ ECOS_KEY = os.environ.get("ECOS_KEY") or "CYKDMCR9HNSZMQ8JBR50"          # 韩�
 DATA_GO_KR_KEY = os.environ.get("DATA_GO_KR_KEY") or ""                         # 公共数据门户通用密钥(Encoding/Decoding均可试), 留空则协会数据用ECOS月频
 # ===================================================================
 
+DEBUG=[]   # 诊断信息, 会写入 data_backup.json 的 meta.debug 供远程排查
+def dbg(msg):
+    print("   [诊断]", msg, flush=True); DEBUG.append(str(msg)[:300])
+
 TODAY = dt.date.today()
 YM  = TODAY.strftime("%Y%m")
 YMD = TODAY.strftime("%Y%m%d")
@@ -74,7 +78,16 @@ def ecos(path):
     return j
 
 def ecos_items(stat):
-    return ecos(f"StatisticItemList/{ECOS_KEY}/json/kr/1/500/{stat}")["StatisticItemList"]["row"]
+    j = ecos(f"StatisticItemList/{ECOS_KEY}/json/kr/1/500/{stat}")
+    rows = (j.get("StatisticItemList") or {}).get("row") or []
+    if not rows:
+        dbg(f"{stat} 项目清单为空, 原始返回键={list(j.keys())} RESULT={j.get('RESULT')}")
+    return rows
+
+def ecos_series_all(stat, cyc, s, e):
+    """不指定项目 → 返回该表全部项目的行(带ITEM_NAME1字段), 绕开项目清单接口"""
+    j = ecos(f"StatisticSearch/{ECOS_KEY}/json/kr/1/100000/{stat}/{cyc}/{s}/{e}/")
+    return (j.get("StatisticSearch") or {}).get("row") or []
 
 def ecos_series(stat, cyc, item, s, e):
     rows = ecos(f"StatisticSearch/{ECOS_KEY}/json/kr/1/100000/{stat}/{cyc}/{s}/{e}/{item}")
@@ -130,39 +143,72 @@ def fetch_deposits():
 
 def fetch_funds_ecos():
     print("· 协会资金面(月频回退, ECOS 901Y056)…", flush=True)
-    items = ecos_items("901Y056")
     kwmap={"yetak":["예탁금"],"yungja":["신용융자","신용거래융자"],"rp":["환매조건부","RP"],"misu":["미수금"],"cma":["CMA"]}
     out={}
+    items = ecos_items("901Y056")
+    if items:
+        dbg("901Y056清单: "+", ".join((r.get("ITEM_NAME") or "?") for r in items[:25]))
+        groups = {}
+        for r in items:
+            nm = r.get("ITEM_NAME") or ""
+            try:
+                pairs = rows_to_pairs(ecos_series("901Y056","M",r["ITEM_CODE"],"197501",YM))
+            except Exception:
+                continue
+            if pairs: groups[nm] = (pairs, r.get("UNIT_NAME"))
+    else:
+        dbg("901Y056项目清单为空 → 整表兜底抓取")
+        rows = ecos_series_all("901Y056","M","197501",YM)
+        dbg(f"整表返回 {len(rows)} 行, 项目: "+", ".join(sorted({r.get('ITEM_NAME1') or '?' for r in rows})[:25]))
+        groups = {}
+        for r in rows:
+            nm = r.get("ITEM_NAME1") or "?"
+            groups.setdefault(nm, ([], r.get("UNIT_NAME")))
+        tmp = {nm:{} for nm in groups}
+        for r in rows:
+            nm = r.get("ITEM_NAME1") or "?"
+            t, v = r.get("TIME",""), r.get("DATA_VALUE")
+            try: v=float(v)
+            except (TypeError,ValueError): continue
+            if len(t)>=6: tmp[nm][f"{t[:4]}-{t[4:6]}"] = v
+        groups = {nm:(sorted(tmp[nm].items()), groups[nm][1]) for nm in groups if tmp[nm]}
     for key,kws in kwmap.items():
-        it=next((r for r in items if any(k in (r.get("ITEM_NAME") or "") for k in kws)),None)
-        if not it: continue
-        try:
-            pairs=rows_to_pairs(ecos_series("901Y056","M",it["ITEM_CODE"],"197501",YM))
-        except Exception: continue
-        if not pairs: continue
-        sc=calibrate(key, pairs[-1][1], it.get("UNIT_NAME"))
-        if sc is None: continue
+        hit = next((nm for nm in groups if any(k in nm for k in kws)), None)
+        if not hit: dbg(f"funds:{key} 关键词未匹配"); continue
+        pairs, unit = groups[hit]
+        sc = calibrate(key, pairs[-1][1], unit)
+        if sc is None: dbg(f"funds:{key} 数量级异常 原始={pairs[-1][1]} 单位={unit}"); continue
         d=[p[0] for p in pairs]; v=[round(p[1]*sc,2) for p in pairs]
-        out[key]={"d":d,"v":v,"f":"M","src":f"ECOS 901Y056·{it.get('ITEM_NAME','')}"}
-        print(f"  ✓ {key}: {len(d)}月 ({d[0]}~{d[-1]}), 最新 {v[-1]:,.1f} 万亿")
+        out[key]={"d":d,"v":v,"f":"M","src":f"ECOS 901Y056·{hit}"}
+        print(f"  ✓ {key}: {len(d)}月 ({d[0]}~{d[-1]}), 最新 {v[-1]:,.1f} 万亿 · {hit}")
     return out
 
 
 def fetch_hhloan():
-    print("· 家庭贷款(BOK月度, ECOS 104Y016)…", flush=True)
-    items = ecos_items("104Y016")
-    cands=[r for r in items if "가계" in (r.get("ITEM_NAME") or "")]
-    cands.sort(key=lambda r: len(r.get("ITEM_NAME") or ""))
-    if not cands:
-        print("  ✗ 104Y016未找到가계项目 · 项目清单:", [r.get("ITEM_NAME") for r in items][:30]); return {}
-    it=cands[0]
-    pairs=rows_to_pairs(ecos_series("104Y016","M",it["ITEM_CODE"],"199001",YM))
-    if not pairs: print("  ✗ 家庭贷款空序列"); return {}
-    sc=calibrate("hhloan", pairs[-1][1], it.get("UNIT_NAME"))
-    if sc is None: print(f"  ✗ 家庭贷款数量级异常 原始={pairs[-1][1]} 单位={it.get('UNIT_NAME')}"); return {}
+    print("· 家庭贷款(BOK月度, ECOS 151Y002 예금취급기관 가계대출)…", flush=True)
+    items = ecos_items("151Y002")
+    it = None
+    if items:
+        dbg("151Y002清单: "+", ".join((r.get("ITEM_NAME") or "?") for r in items[:25]))
+        it = next((r for r in items if "예금은행" in (r.get("ITEM_NAME") or "")), None)
+        if it is None:
+            cands=[r for r in items if "가계" in (r.get("ITEM_NAME") or "") or "합계" in (r.get("ITEM_NAME") or "")]
+            cands.sort(key=lambda r: len(r.get("ITEM_NAME") or ""))
+            it = cands[0] if cands else items[0]
+    if it is not None:
+        pairs = rows_to_pairs(ecos_series("151Y002","M",it["ITEM_CODE"],"200001",YM))
+        unit = it.get("UNIT_NAME")
+        name = it.get("ITEM_NAME","")
+    else:
+        rows = [r for r in ecos_series_all("151Y002","M","200001",YM) if "예금은행" in (r.get("ITEM_NAME1") or "")]
+        pairs = rows_to_pairs(rows); unit = rows[0].get("UNIT_NAME") if rows else ""
+        name = rows[0].get("ITEM_NAME1","整表兜底") if rows else ""
+    if not pairs: dbg("151Y002 家庭贷款空序列"); return {}
+    sc = calibrate("hhloan", pairs[-1][1], unit)
+    if sc is None: dbg(f"家庭贷款数量级异常 原始={pairs[-1][1]} 单位={unit}"); return {}
     d=[p[0] for p in pairs]; v=[round(p[1]*sc,1) for p in pairs]
-    print(f"  ✓ {len(d)}个月 ({d[0]}~{d[-1]}), 最新 {v[-1]:,.1f} 万亿 · 项目:{it.get('ITEM_NAME')}")
-    return {"hhloan":{"d":d,"v":v,"f":"M","src":f"ECOS 104Y016·{it.get('ITEM_NAME','')}"}}
+    print(f"  ✓ {len(d)}个月 ({d[0]}~{d[-1]}), 最新 {v[-1]:,.1f} 万亿 · 项目:{name}")
+    return {"hhloan":{"d":d,"v":v,"f":"M","src":f"ECOS 151Y002·{name}"}}
 
 # ---------------------------- data.go.kr 协会日频 ----------------------------
 G = "https://apis.data.go.kr/1160100/service/GetKofiaStatisticsInfoService"
@@ -177,8 +223,9 @@ OP_CANDS = {  # 官方仅公开①getTrustScaleInfo, 其余按命名惯例探测
 def gk(op, page=1, rows=5000):
     r = requests.get(f"{G}/{op}", params={"serviceKey":DATA_GO_KR_KEY,"pageNo":page,
         "numOfRows":rows,"resultType":"json"}, timeout=90)
-    if r.status_code!=200: raise RuntimeError(f"HTTP{r.status_code}")
-    j=r.json()
+    if r.status_code!=200: raise RuntimeError(f"HTTP{r.status_code} {r.text[:80]}")
+    try: j=r.json()
+    except ValueError: raise RuntimeError("非JSON:"+r.text[:100])
     hd=j.get("response",{}).get("header",{})
     if hd.get("resultCode") not in ("00","0"): raise RuntimeError(hd.get("resultMsg","err"))
     body=j["response"]["body"]
@@ -189,11 +236,22 @@ def probe(group):
         try:
             items,total=gk(op,1,2)
             if total>0:
-                print(f"  探测成功: {op} (共{total}行)")
+                dbg(f"探测成功 {group}:{op} 共{total}行 字段={list(items[0].keys()) if items else '?'}")
                 return op,total
-        except Exception:
-            continue
+            dbg(f"{group}:{op} total=0")
+        except Exception as e:
+            dbg(f"{group}:{op} {str(e)[:80]}")
     return None,0
+
+def key_check():
+    """用官方文档公开的操作①验证 data.go.kr 钥匙+服务名是否有效"""
+    try:
+        items,total=gk("getTrustScaleInfo",1,2)
+        dbg(f"钥匙验证: getTrustScaleInfo 可用, total={total} → 钥匙/服务名OK, 若其他op失败则为操作名问题")
+        return True
+    except Exception as e:
+        dbg(f"钥匙验证失败: {str(e)[:120]} → 钥匙未生效或服务地址问题")
+        return False
 
 def date_field(item):
     for k,v in item.items():
@@ -234,6 +292,7 @@ def series_from_items(items, val_kws, anchor_key):
 def fetch_funds_daily():
     print("· 协会资金面(日频, data.go.kr)…", flush=True)
     out={}
+    key_check()
     op,total=probe("fund")
     if op:
         items=pull_all(op,total)
@@ -262,7 +321,7 @@ def fetch_funds_daily():
 
 # ---------------------------- 主流程 ----------------------------
 def main():
-    out={"meta":{"fetched_at":dt.datetime.now().strftime("%Y-%m-%d %H:%M"),"notes":[]}}
+    out={"meta":{"fetched_at":dt.datetime.now().strftime("%Y-%m-%d %H:%M"),"notes":[],"debug":DEBUG}}
     try: out["mcap"]=fetch_mcap()
     except Exception as e: print(f"  ✗ 市值失败: {e}"); out["meta"]["notes"].append(f"mcap失败:{e}")
     try: out.update(fetch_deposits())
