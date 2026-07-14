@@ -74,7 +74,7 @@ button:disabled{background:#B9C2D0;cursor:wait}
 
 <div class="tapenote">
  <b>本监测台</b>：追踪韩国股市资金面与杠杆的20项官方序列，按资金旅程分三组——<b>银行体系</b>（存款与家庭信贷·钱的源头·月/季频）→ <b>券商数据</b>（客户现金·基金渠道·场内杠杆与强平·日频）→ <b>杠杆产品</b>（期货持仓·杠杆ETF·ELS/DLS结构化产品）。<br>
- <b>读法</b>：每张卡左图＝总额＋YoY＋KOSPI指数对数对比线；右图＝占KOSPI总市值比重（剔除牛熊市值膨胀后的真实杠杆强度）；红=同比扩张、蓝=同比收缩（韩股配色）；图表支持滚轮缩放、拖动平移、双击复位。<br>
+ <b>读法</b>：每张卡左图＝总额＋YoY＋KOSPI指数对数对比线；右图＝占KOSPI总市值比重（剔除牛熊市值膨胀后的真实杠杆强度）；快照标签红＝YoY为正、蓝＝为负；<b>曲线颜色＝YoY动能</b>：较一个月前加速＝红、减速或转负＝蓝（拐点敏感）；图表支持滚轮缩放、拖动平移、双击复位。<br>
  <b>来源与更新</b>：韩国银行ECOS · 金融投资协会FreeSIS（T+1披露）· 金融委公共数据门户，全部官方接口直连；GitHub Actions每交易日KST 09:30自动更新。<b>单位</b>：T＝万亿韩元（조원），B＝十亿韩元（십억원）。
 </div>
 <div class="tapehead">五渠道杠杆快照（红＝YoY上升 · 蓝＝YoY下降，韩股配色惯例）</div>
@@ -135,6 +135,17 @@ function kospiAtDate(dt){
   if(!KOSPI_D)return null;
   if(dt.length===7){for(let i=KOSPI_D.d.length-1;i>=0;i--){if(KOSPI_D.d[i].slice(0,7)===dt)return KOSPI_D.v[i]}return null}
   const i=KOSPI_D.d.indexOf(dt);return i>=0?KOSPI_D.v[i]:null;
+}
+function shiftMonth(ds){const y=+ds.slice(0,4),m=+ds.slice(5,7);const nm=m===1?12:m-1,ny=m===1?y-1:y;
+  return String(ny).padStart(4,'0')+'-'+String(nm).padStart(2,'0')+ds.slice(7)}
+function yoyAccel(dates,ys){
+  let i=ys.length-1;while(i>=0&&ys[i]==null)i--;
+  if(i<0)return null;
+  const tgt=shiftMonth(dates[i]);let j=-1;
+  for(let k=i-1;k>=0;k--){if(dates[k]<=tgt&&ys[k]!=null){j=k;break}}
+  if(j<0){for(let k=i-1;k>=0;k--){if(ys[k]!=null){j=k;break}}}
+  if(j<0)return null;
+  return ys[i]-ys[j];
 }
 function applyExternal(){
   const X=window.KOREA_DATA; if(!X) return false;
@@ -276,7 +287,8 @@ function renderSeries(s){
   const mc=mcapAtDate(d.d[i]);const r=(v!=null&&mc)?v/mc*100:null;
   document.getElementById('stats-'+s.key).innerHTML=statHTML(d.d[i],v,y,r);
   document.getElementById('freq-'+s.key).textContent=freqLabel(d.f)+' · '+d.src.split('·')[0];
-  dualChart('lv-'+s.key,d.d,d.v,yoySeries(d.d,d.v),(y!=null&&y>0)?'#C93A36':'#24406B');
+  const ys=yoySeries(d.d,d.v);const acc=yoyAccel(d.d,ys);
+  dualChart('lv-'+s.key,d.d,d.v,ys,(acc!=null&&acc>0)?'#C93A36':'#24406B');
   const hasM=MCAP_D||Object.keys(MCAP_M).length;
   if(hasM){const rs=d.d.map((dt,ix)=>{const m=mcapAtDate(dt);return(d.v[ix]!=null&&m)?+(d.v[ix]/m*100).toFixed(3):null});
     if(rs.some(x=>x!=null)){nd2.style.display='none';ratioChart('rt-'+s.key,d.d,rs)}
