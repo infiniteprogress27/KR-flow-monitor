@@ -68,16 +68,16 @@ button:disabled{background:#B9C2D0;cursor:wait}
 <div class="wrap">
 <header>
   <h1>韩国股市资金面 · 杠杆监测台<small>十一项核心指标 · 总额 / YoY / 占KOSPI总市值 · ECOS官方接口 · 本地脚本或GitHub云端自动更新</small></h1>
-  <div class="hright"><span class="badge">单位统一：万亿韩元</span></div>
+  <div class="hright"><span class="badge">单位：T＝T · B＝B韩元</span></div>
   <div id="status">初始化…</div>
 </header>
 
-<div class="tapehead">五渠道杠杆快照（红＝YoY上升 · 蓝＝YoY下降，韩股配色惯例）</div>
 <div class="tapenote">
- <b>用法</b>：一眼读韩股杠杆的方向与强度——红色扩张、蓝色收缩；数值为最新交易日，标签含数据日期。<br>
- <b>定义</b>：<b>融资余额</b>＝信用交易融资（신용거래융자）未偿本金，正式加杠杆通道；<b>股票质押</b>＝预托证券担保融资，存量持仓套现通道；<b>预托金+RP</b>＝客户在券商的现金合计（含RP理财），入市弹药总量；<b>赊欠额</b>＝委托买卖未收金（미수금），T+2结算违约挂账，超短杠杆断供量；<b>强平额</b>＝赊欠额×强平比重估算（반대매매），次日开盘被强制卖出的规模。<br>
- <b>来源</b>：金融投资协会（日频·T+1披露）、韩国银行ECOS、金融委开放数据 · 除注明外单位为万亿韩元。
+ <b>本监测台</b>：追踪韩国股市资金面与杠杆的20项官方序列，按资金旅程分三组——<b>银行体系</b>（存款与家庭信贷·钱的源头·月/季频）→ <b>券商数据</b>（客户现金·基金渠道·场内杠杆与强平·日频）→ <b>杠杆产品</b>（期货持仓·杠杆ETF·ELS/DLS结构化产品）。<br>
+ <b>读法</b>：每张卡左图＝总额＋YoY＋KOSPI指数对数对比线；右图＝占KOSPI总市值比重（剔除牛熊市值膨胀后的真实杠杆强度）；红=同比扩张、蓝=同比收缩（韩股配色）；图表支持滚轮缩放、拖动平移、双击复位。<br>
+ <b>来源与更新</b>：韩国银行ECOS · 金融投资协会FreeSIS（T+1披露）· 金融委公共数据门户，全部官方接口直连；GitHub Actions每交易日KST 09:30自动更新。<b>单位</b>：T＝万亿韩元（조원），B＝十亿韩元（십억원）。
 </div>
+<div class="tapehead">五渠道杠杆快照（红＝YoY上升 · 蓝＝YoY下降，韩股配色惯例）</div>
 <div class="tape" id="tape"></div>
 
 <div class="rows" id="rows"></div>
@@ -103,7 +103,7 @@ button:disabled{background:#B9C2D0;cursor:wait}
   <tr><td>股票质押 / 强平比例 / 家庭信用</td><td>内置底稿（协会FreeSIS与韩银无对应开放接口项 / 季频），更新需官网下载</td></tr>
  </table>
  <h3>方法说明</h3>
- <p>① 各序列取官方最高频率：市值日频、存款与协会资金面月频（协会日频仅官网提供）、家庭信用季频。② YoY＝对12个月（家庭信用4个季度）前。③ 占市值＝指标÷当月最后交易日KOSPI总市值。④ 单位按接口返回单位字段自动换算为万亿韩元。⑤ AI代理转录的数据建议抽查1-2个点与ECOS页面核对。⑥ 接口密钥明文内嵌，请勿公开分发。⑦ 原需求第2、9条比率分母笔误已按各指标自身÷市值更正。</p>
+ <p>① 各序列取官方最高频率：市值日频、存款与协会资金面月频（协会日频仅官网提供）、家庭信用季频。② YoY＝对12个月（家庭信用4个季度）前。③ 占市值＝指标÷当月最后交易日KOSPI总市值。④ 单位按接口返回单位字段自动换算为T。⑤ AI代理转录的数据建议抽查1-2个点与ECOS页面核对。⑥ 接口密钥明文内嵌，请勿公开分发。⑦ 原需求第2、9条比率分母笔误已按各指标自身÷市值更正。</p>
 </div>
 </div>
 
@@ -224,7 +224,7 @@ function mkChart(id,cfg){
 }
 function dualChart(id,labels,lv,yy,color){
   const ds=[
-   {label:'总额(万亿韩元)',data:lv,borderColor:color,borderWidth:1.6,pointRadius:0,spanGaps:true,yAxisID:'y'},
+   {label:'总额(T)',data:lv,borderColor:color,borderWidth:1.6,pointRadius:0,spanGaps:true,yAxisID:'y'},
    {label:'YoY(%)',data:yy,borderColor:'#9AA7BC',borderDash:[4,3],borderWidth:1.1,pointRadius:0,spanGaps:true,yAxisID:'y1'}];
   const ks=labels.map(dt=>kospiAtDate(dt));
   const hasK=ks.some(x=>x!=null);
@@ -236,7 +236,7 @@ function dualChart(id,labels,lv,yy,color){
   mkChart(id,{type:'line',data:{labels,datasets:ds},
   options:{responsive:true,maintainAspectRatio:false,animation:false,interaction:{mode:'index',intersect:false},
    plugins:{legend:{display:true,labels:{boxWidth:16,boxHeight:2,font:{size:11},color:'#5E6D86'}},
-    tooltip:{titleFont:{family:mono},bodyFont:{family:mono},callbacks:{label:c=>c.dataset.label.startsWith('KOSPI')?` KOSPI ${c.parsed.y==null?'—':tick(c.parsed.y)}`:(c.dataset.label.includes('YoY')?` YoY ${c.parsed.y==null?'—':c.parsed.y.toFixed(1)+'%'}`:` 总额 ${fmt(c.parsed.y)} 万亿`)}}},
+    tooltip:{titleFont:{family:mono},bodyFont:{family:mono},callbacks:{label:c=>c.dataset.label.startsWith('KOSPI')?` KOSPI ${c.parsed.y==null?'—':tick(c.parsed.y)}`:(c.dataset.label.includes('YoY')?` YoY ${c.parsed.y==null?'—':c.parsed.y.toFixed(1)+'%'}`:` 总额 ${fmt(c.parsed.y)} T`)}}},
    scales:sc}});
 }
 function ratioChart(id,labels,vals){
@@ -255,12 +255,12 @@ function buildCards(){
       <div class="chlbl">比例时序（%）</div><div class="cv" style="height:260px"><canvas id="ch-forced"></canvas></div></div>`;
     return `<div class="card" id="card-${s.key}"><div class="chead"><span class="cnum">${String(s.no).padStart(2,'0')}</span><span class="ctitle">${s.title}</span><span class="freq" id="freq-${s.key}"></span><div class="stats" id="stats-${s.key}"></div></div>
      <div class="charts">
-      <div><div class="chlbl">总额（左轴，万亿）＋ YoY（右轴，%）＋ KOSPI指数（绿·对数右二轴）</div><div class="cv"><canvas id="lv-${s.key}"></canvas><div class="nodata" id="nd1-${s.key}" style="display:none"></div></div></div>
+      <div><div class="chlbl">总额（左轴，T）＋ YoY（右轴，%）＋ KOSPI指数（绿·对数右二轴）</div><div class="cv"><canvas id="lv-${s.key}"></canvas><div class="nodata" id="nd1-${s.key}" style="display:none"></div></div></div>
       <div><div class="chlbl">占KOSPI总市值（%）</div><div class="cv"><canvas id="rt-${s.key}"></canvas><div class="nodata" id="nd2-${s.key}" style="display:none"></div></div></div>
      </div></div>`;
   }).join('');
 }
-const statHTML=(d,v,y,r)=>`<div class="stat"><div class="l">最新余额 · ${d}</div><div class="n">${fmt(v)}<small> 万亿韩元</small></div></div>
+const statHTML=(d,v,y,r)=>`<div class="stat"><div class="l">最新余额 · ${d}</div><div class="n">${fmt(v)}<small> T</small></div></div>
  <div class="stat"><div class="l">YoY</div><div class="n"><span class="pill ${pillCls(y)}">${pct(y)}</span></div></div>
  <div class="stat"><div class="l">占市值</div><div class="n">${r==null?'<small>待市值</small>':r.toFixed(2)+'%'}</div></div>`;
 function renderSeries(s){
@@ -301,18 +301,18 @@ function forcedAmtSeries(){
   const fm={};f.d.forEach((dt,i)=>fm[dt]=f.v[i]);
   const d=[],v=[];
   m.d.forEach((dt,i)=>{if(fm[dt]!=null&&m.v[i]!=null){d.push(dt);v.push(+(m.v[i]*fm[dt]/100*1000).toFixed(1))}});
-  return d.length?{d,v}:null;   // 单位: 十亿韩元(억×10)
+  return d.length?{d,v}:null;   // 单位: B韩元(억×10)
 }
 function buildTape(){
   const items=[['融资余额','yungja'],['股票质押','jiya'],['预托金+RP','yetakrp'],['赊欠额','misu'],['强平额(估算)','__f'],['KOSPI市值','__m']];
   document.getElementById('tape').innerHTML=items.map(([n,k])=>{
     if(k==='__m'){if(!MCAP)return `<div class="chip"><div class="k">KOSPI市值</div><div class="v">—</div><span class="y pn">待脚本拉取</span></div>`;
-      return `<div class="chip"><div class="k">${n} · ${MCAP.date}</div><div class="v">${fmt(MCAP.val,0)}<small> 万亿</small></div><span class="y pn">日频</span></div>`}
+      return `<div class="chip"><div class="k">${n} · ${MCAP.date}</div><div class="v">${fmt(MCAP.val,0)}<small> T</small></div><span class="y pn">日频</span></div>`}
     if(k==='__f'){const s=forcedAmtSeries();if(!s)return '';
       const {v,i}=last(s.v);const y=yoyLatest(s.d,s.v);
-      return `<div class="chip"><div class="k">${n} · ${s.d[i]}</div><div class="v">${fmt(v)}<small> 十亿</small></div><span class="y ${pillCls(y)}">YoY ${pct(y)}</span></div>`}
+      return `<div class="chip"><div class="k">${n} · ${s.d[i]}</div><div class="v">${fmt(v)}<small> B</small></div><span class="y ${pillCls(y)}">YoY ${pct(y)}</span></div>`}
     const d=SER[k];if(!d)return '';const {v,i}=last(d.v);const y=yoyLatest(d.d,d.v);
-    return `<div class="chip"><div class="k">${n} · ${d.d[i]}</div><div class="v">${fmt(v)}<small> 万亿</small></div><span class="y ${pillCls(y)}">YoY ${pct(y)}</span></div>`}).join('');
+    return `<div class="chip"><div class="k">${n} · ${d.d[i]}</div><div class="v">${fmt(v)}<small> T</small></div><span class="y ${pillCls(y)}">YoY ${pct(y)}</span></div>`}).join('');
 }
 function renderAll(){buildTape();activeS().forEach(s=>{if(s.divider)return;s.type==='ratio'?renderForced():renderSeries(s)})}
 
