@@ -37,7 +37,7 @@ ANCHOR = {"yetak":121.6, "yungja":37.3, "jiya":25.5, "rp":108.8, "misu":1.3, "cm
 
 
 # 合理区间(万亿韩元): 数量级校准的硬约束
-RANGE = {"mcap":(800,12000),"kospi":(300,20000),"demand":(200,2000),"time":(400,3000),"hhloan":(600,2500),"otherloan":(80,1200),"futoi":(10,800),"levetf":(2,200),"els":(0.2,40),"nbloan":(80,900),"mmf":(30,400),"stockfund":(20,500),"ovsderiv":(30,2000),"dls":(0.05,20),
+RANGE = {"mcap":(800,12000),"kospi":(300,20000),"demand":(200,2000),"time":(400,3000),"hhloan":(600,2500),"otherloan":(80,1200),"futoi":(10,800),"levetf":(2,200),"els":(1,150),"nbloan":(80,900),"mmf":(30,400),"stockfund":(20,500),"ovsderiv":(30,2000),"dls":(0.5,80),
          "yetak":(5,400),"yungja":(1,120),"jiya":(1,120),"rp":(5,400),"misu":(0.05,20),"cma":(5,400)}
 def calibrate(key, raw_latest, unit_name):
     """先按单位字段换算, 若落在合理区间直接用; 否则在10的幂里找能落区间的档位"""
@@ -389,11 +389,12 @@ def fetch_futoi():
         pcs=sorted({str(r.get("prdCtg","")) for r in rows})
         dbg(f"futoi:{kw} prdCtg取值: {pcs[:8]}")
         kwn=kw.replace(" ","")
+        pat=re.compile("^"+re.escape(kwn)+"F[0-9]{6}([(][0-9 ]+[)])?$")
         n=0
         for r in rows:
-            nm=str(r.get(nm_field,"")); nm2=nm.replace(" ","")
-            if kwn not in nm2 or "선물" not in nm2: continue
-            if any(x in nm2 for x in EXCL): continue
+            nm2=str(r.get(nm_field,"")).replace(" ","")
+            if not pat.match(nm2): continue
+            if "야간" in str(r.get("prdCtg","")): continue
             t=str(r.get(df,""))
             oi=_num(r.get(oi_field)); cl=_num(r.get(cl_field))
             if len(t)!=8 or oi is None or cl is None: continue
@@ -517,77 +518,54 @@ def fetch_ovsderiv():
     print(f"  ✓ ovsderiv 月度 {len(dd)}点 最新{vv[-1]:,.1f}万亿")
     return {"ovsderiv":{"d":dd,"v":vv,"f":"M","src":"협회·해외파생상품 거래실적 月度加总(口径待核)"}}
 
-def fetch_dls():
-    print("· DLS/DLB发行(협회 getDLSAndDLBInfo)…", flush=True)
+
+def _els_dls_core(op, key, label):
     try:
-        items,total=gk("getDLSAndDLBInfo",1,3)
-        if total==0: dbg("dls total=0"); return {}
-        rows=pull_all("getDLSAndDLBInfo",total)
+        items,total=gk(op,1,3)
+        if total==0: dbg(f"{key} total=0"); return {}
+        rows=pull_all(op,total)
     except Exception as e:
-        dbg(f"dls {str(e)[:100]}"); return {}
+        dbg(f"{key} {str(e)[:100]}"); return {}
     if not rows: return {}
-    dbg(f"dls字段样例: {list(rows[0].keys())}")
-    dbg(f"dls首行: {str(rows[0])[:180]}")
-    amt=next((k for k in rows[0] if "isu" in k.lower() and "amt" in k.lower()),None) or \
-        next((k for k in rows[0] if k.lower()=="amt"),None) or \
+    dbg(f"{key}字段样例: {list(rows[0].keys())} 首行: {str(rows[0])[:150]}")
+    amt=next((k for k in rows[0] if k.lower()=="amt"),None) or \
         next((k for k in rows[0] if "amt" in k.lower()),None)
-    ctg=next((k for k in rows[0] if "dlbdls" in k.lower() or "dlsdlb" in k.lower()),None) or \
-        next((k for k in rows[0] if "ctg" in k.lower()),None)
-    if not amt: dbg("dls未找到金额字段"); return {}
-    vals=sorted({str(r.get(ctg,"")) for r in rows}) if ctg else []
+    ctg=next((k for k in rows[0] if "elbels" in k.lower() or "dlbdls" in k.lower()),None) or \
+        next((k for k in rows[0] if k.lower().startswith("ctg") and "psub" not in k.lower()),None)
+    if not amt or not ctg: dbg(f"{key}字段缺失 amt={amt} ctg={ctg}"); return {}
+    vals=sorted({str(r.get(ctg,"")) for r in rows})
     pres=sorted({str(r.get("presCtg","")) for r in rows})
-    dbg(f"dls分类{ctg}取值: {vals[:8]} | presCtg: {pres[:8]}")
-    dls_val=next((v for v in vals if "비보장" in v),None) or \
-            next((v for v in vals if "DLS" in v.upper()),None)
-    pres_val=next((p for p in pres if "발행" in p),None)
+    dbg(f"{key}分类: {vals[:8]} | presCtg: {pres[:8]}")
+    want_ctg=next((v for v in vals if "비보장" in v),None)
+    want_pres=next((p for p in pres if "미상환" in p or "잔고" in p),None) or \
+              next((p for p in pres if "발행" in p),None)
+    if want_ctg is None or want_pres is None:
+        dbg(f"{key}分类锁定失败 ctg={want_ctg} pres={want_pres}"); return {}
     monthly={}
     for r in rows:
-        if dls_val is not None and str(r.get(ctg,""))!=dls_val: continue
-        if pres_val is not None and str(r.get("presCtg",""))!=pres_val: continue
+        if str(r.get(ctg,""))!=want_ctg: continue
+        if str(r.get("presCtg",""))!=want_pres: continue
         v=_num(r.get(amt))
         if v is None: continue
         kd=_ymkey(r.get("basDt"))
         if not kd: continue
         monthly[kd]=monthly.get(kd,0.0)+v
-    if not monthly: return {}
+    if not monthly: dbg(f"{key}过滤后为空 ({want_ctg}/{want_pres})"); return {}
     dd=sorted(monthly); raw=[monthly[x] for x in dd]
-    sc=calibrate("dls",raw[-2] if len(raw)>1 else raw[-1],"원")
-    if sc is None: dbg(f"dls数量级异常 原始={raw[-1]}"); return {}
+    sc=calibrate(key, raw[-2] if len(raw)>1 else raw[-1], "원")
+    if sc is None: dbg(f"{key}数量级异常 原始={raw[-1]}"); return {}
     vv=[round(x*sc,2) for x in raw]
-    print(f"  ✓ dls 月度发行 {len(dd)}点 最新{vv[-1]:,.2f}万亿")
-    return {"dls":{"d":dd,"v":vv,"f":"M","src":"협회·getDLSAndDLBInfo DLS发行额按月加总"}}
+    kind="未偿余额" if ("미상환" in want_pres or "잔고" in want_pres) else "发行额"
+    print(f"  ✓ {key} 月度{kind} {len(dd)}点 ({dd[0]}~{dd[-1]}) 最新{vv[-1]:,.2f}万亿 · {want_ctg}/{want_pres}")
+    return {key:{"d":dd,"v":vv,"f":"M","src":f"협회·{label}({want_ctg}) {want_pres}"}}
 
 def fetch_els():
-    print("· ELS/ELB发行动向(现有协会服务)…", flush=True)
-    try:
-        items,total=gk("getELSAndELBInfo",1,3)
-        if total==0: dbg("els total=0"); return {}
-        rows=pull_all("getELSAndELBInfo",total)
-    except Exception as e:
-        dbg(f"els {str(e)[:100]}"); return {}
-    if not rows: return {}
-    dbg(f"els字段样例: {list(rows[0].keys())}")
-    dbg(f"els首行: {str(rows[0])[:180]}")
-    amt=next((k for k in rows[0] if "isu" in k.lower() and "amt" in k.lower()),None) or         next((k for k in rows[0] if "amt" in k.lower()),None)
-    ctg=next((k for k in rows[0] if "ctg" in k.lower() or "tpcd" in k.lower() or "scrt" in k.lower()),None)
-    if not amt: dbg("els未找到金额字段"); return {}
-    monthly={}
-    for r in rows:
-        if ctg:
-            cv=str(r.get(ctg,""))
-            if cv and "ELS" not in cv.upper(): continue
-        v=_num(r.get(amt))
-        if v is None: continue
-        key=_ymkey(r.get("basDt"))
-        if not key: continue
-        monthly[key]=monthly.get(key,0.0)+v
-    if not monthly: return {}
-    dd=sorted(monthly); raw=[monthly[x] for x in dd]
-    sc=calibrate("els", raw[-2] if len(raw)>1 else raw[-1], "원")
-    if sc is None: dbg(f"els数量级异常 最新原始={raw[-1]}"); return {}
-    vv=[round(x*sc,2) for x in raw]
-    print(f"  ✓ els 月度发行 {len(dd)}点 ({dd[0]}~{dd[-1]}) 最新{vv[-1]:,.2f}万亿")
-    return {"els":{"d":dd,"v":vv,"f":"M","src":"협회·getELSAndELBInfo ELS发行额按月加总"}}
+    print("· ELS(협회 getELSAndELBInfo)…", flush=True)
+    return _els_dls_core("getELSAndELBInfo","els","ELS")
+
+def fetch_dls():
+    print("· DLS(협회 getDLSAndDLBInfo)…", flush=True)
+    return _els_dls_core("getDLSAndDLBInfo","dls","DLS")
 
 def fetch_deriv():
     out={}
