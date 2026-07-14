@@ -35,6 +35,8 @@ button:disabled{background:#B9C2D0;cursor:wait}
 .rows{display:flex;flex-direction:column;gap:16px;margin-top:16px}
 .card{background:var(--panel);border:1px solid var(--grid);border-left:4px solid var(--line);border-radius:6px;padding:16px 18px}
 .card.pending{border-left-color:var(--warn)}
+.secdiv{display:flex;align-items:center;gap:16px;margin:34px 0 6px;color:#8A8272;font-size:13px;letter-spacing:.12em;font-weight:600}
+.secdiv::before,.secdiv::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,transparent,#C9BFA8,transparent)}
 .chead{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:10px}
 .cnum{font:800 12px var(--mono);color:#fff;background:var(--line);border-radius:3px;padding:3px 7px}
 .card.pending .cnum{background:var(--warn)}
@@ -79,14 +81,14 @@ button:disabled{background:#B9C2D0;cursor:wait}
   <tr><td>活期 / 定期·储蓄性存款</td><td>ECOS 104Y015「存款银行韩元存款（按种类·月末余额）」· 月频 · 1990年起</td></tr>
   <tr><td>KOSPI总市值</td><td>ECOS 802Y001（日频，近两年逐日）＋ 901Y014（月频，全历史）拼接 · 交易所源 · 比率按当月最后交易日对齐</td></tr>
   <tr><td>预托金/融资/回购/垫付欠款/CMA</td><td>内置协会官网底稿（2000-01～2026-06）＋ ECOS 901Y056「股市周边资金动向」增量自动补新</td></tr>
+  <tr><td>预托金＋RP（4A）</td><td>04与06按交易日对齐加总 · 客户在券商处的现金总弹药（未上保险栓+已上保险栓）· 消除两者互相搬家造成的单线噪音</td></tr>
+  <tr><td>KOSPI指数灰线</td><td>ECOS 802Y001 코스피지수 · 日频 · 各占市值图右二轴，仅作走势对比</td></tr>
   <tr><td>非银行家庭贷款（3D）</td><td>ECOS 151Y002 비은행예금취급기관（储蓄银行/相互金融等二金融圈）家庭贷款末残 · 月频 · 与03B对照读监管套利式加杠杆（银行降+非银升）</td></tr>
   <tr><td>MMF/股票型基金（5B/5C）</td><td>协会「getFundTotalNetEssetInfo」按基金类型净资产 · MMF与CMA/预托金互为资金分流；股票型基金为间接入市通道</td></tr>
   <tr><td>DLS/DLB发行额（13B）</td><td>协会「getDLSAndDLBInfo」月度加总（流量口径）</td></tr>
-  <tr><td>海外衍生品实绩（15）</td><td>协会「getDerivationProductTradingInfo」月度加总 · 本土投资者海外期货/期权交易实绩 · 风险偏好溢出阀（单位口径以诊断为准，标注待核）</td></tr>
   <tr><td>期货未平仓名义（11）</td><td>金融委「파생상품시세정보」선물시세 · 日频 · 名义规模＝未平仓合约×收盘价×乘数（KOSPI200为25万韩元/点，个股期货为10股），跨到期月加总，剔除迷你/周度/价差合约 · 2020年起</td></tr>
   <tr><td>杠杆ETF总市值（12）</td><td>金融委「증권상품시세정보」ETF시세 · 日频 · 名称含「레버리지」的全部上市ETF市值加总（本土多头杠杆系）· 2020年起</td></tr>
   <tr><td>ELS/ELB发行额（13）</td><td>协会「getELSAndELBInfo」 · 按月加总的发行金额（流量口径，非存量余额；存量在预托决算院SEIBro，二期接入）</td></tr>
-  <tr><td>CFD名目余额（14）</td><td>协会FreeSIS月度披露（2023年SG事件后强制公开）· 无API，脚本内CFD_MANUAL数组手动维护</td></tr>
   <tr><td>其他贷款（BOK月度）</td><td>ECOS 151Y005「存款受理机构家庭贷款（按用途·月末余额）」其他贷款项＝非抵押部分（信用贷/负存折等빚투主通道）· 月频 · 与03B之差即住房抵押贷款</td></tr>
   <tr><td>家庭贷款（BOK月度）</td><td>ECOS 104Y016「存款银行贷款（月末余额）」家庭贷款项 · 月频 · 与季度家庭信用互为月度先行/季度定盘关系</td></tr>
   <tr><td>股票质押 / 强平比例 / 家庭信用</td><td>内置底稿（协会FreeSIS与韩银无对应开放接口项 / 季频），更新需官网下载</td></tr>
@@ -111,6 +113,20 @@ function initFromRaw(){
   SER.hh={d:RAW.hh.dates.slice(),v:RAW.hh.vals.slice(),f:'Q',src:'内置底稿·韩银'};
   SER.demand=null;SER.time=null;SER.hhloan=null;SER.otherloan=null;SER.nbloan=null;SER.mmf=null;SER.stockfund=null;
 }
+let KOSPI_D=null;
+function buildCombined(){
+  const a=SER.yetak,b=SER.rp;
+  if(!a||!b||!a.d||!b.d){SER.yetakrp=null;return}
+  const bm={};b.d.forEach((dt,i)=>bm[dt]=b.v[i]);
+  const d=[],v=[];
+  a.d.forEach((dt,i)=>{if(bm[dt]!=null&&a.v[i]!=null){d.push(dt);v.push(+(a.v[i]+bm[dt]).toFixed(2))}});
+  SER.yetakrp=d.length?{d,v,f:a.f,src:'预托金＋对客RP 同日加总'}:null;
+}
+function kospiAtDate(dt){
+  if(!KOSPI_D)return null;
+  if(dt.length===7){for(let i=KOSPI_D.d.length-1;i>=0;i--){if(KOSPI_D.d[i].slice(0,7)===dt)return KOSPI_D.v[i]}return null}
+  const i=KOSPI_D.d.indexOf(dt);return i>=0?KOSPI_D.v[i]:null;
+}
 function applyExternal(){
   const X=window.KOREA_DATA; if(!X) return false;
   if(X.mcap&&X.mcap.d&&X.mcap.d.length){
@@ -123,6 +139,8 @@ function applyExternal(){
     if(s&&s.d&&s.d.length&&(s.f==='D'||!SER[k]||s.d.length>=SER[k].d.length))SER[k]=s});
   if(X.deriv)Object.keys(X.deriv).forEach(k=>{const s=X.deriv[k];
     if(s&&s.d&&s.d.length)SER[k]=s});
+  if(X.kospi&&X.kospi.d)KOSPI_D={d:X.kospi.d,v:X.kospi.v};
+  buildCombined();
   return true;
 }
 
@@ -154,17 +172,21 @@ function mcapAtDate(d){
 
 /* ================= 指标注册 ================= */
 const S=[
+ {divider:1,label:'银行体系 · 韩国银行 · 月频/季频'},
  {no:1,key:'demand',title:'活期存款（存款银行）'},
  {no:2,key:'time',title:'定期 / 储蓄性存款'},
  {no:3,key:'hh',title:'家庭信用贷款总额（季度·最广口径）'},
  {no:'3B',key:'hhloan',title:'家庭贷款（存款银行·BOK月度）'},
  {no:'3C',key:'otherloan',title:'其他贷款（기타대출·非抵押·BOK月度）'},
  {no:'3D',key:'nbloan',title:'非银行家庭贷款（제2금융권·监管溢出信号）'},
+ {divider:1,label:'券商体系资金 · 金融投资协会 · 日频'},
+ {no:'4A',key:'yetakrp',title:'预托金＋RP（客户现金总弹药）',hot:1},
  {no:4,key:'yetak',title:'客户保证金存款（预托金）'},
+ {no:6,key:'rp',title:'券商对客户回购余额'},
  {no:5,key:'cma',title:'CMA账户总余额'},
  {no:'5B',key:'mmf',title:'MMF净资产（货币基金·停车场对照）'},
  {no:'5C',key:'stockfund',title:'股票型基金净资产（间接入市渠道）'},
- {no:6,key:'rp',title:'券商对客户回购余额'},
+ {divider:1,label:'杠杆与衍生品 · 协会/金融委 · 日频为主'},
  {no:7,key:'yungja',title:'融资余额',hot:1},
  {no:8,key:'jiya',title:'股票质押借款余额',hot:1},
  {no:9,key:'misu',title:'垫付欠款余额',hot:1},
@@ -173,11 +195,9 @@ const S=[
  {no:12,key:'levetf',title:'本土杠杆ETF总市值（레버리지系合计）',hot:1},
  {no:13,key:'els',title:'ELS/ELB发行额（月度流量·结构化产品需求）'},
  {no:'13B',key:'dls',title:'DLS/DLB发行额（月度流量）'},
- {no:14,key:'cfd',title:'CFD名目余额（月频·手动维护）'},
- {no:15,key:'ovsderiv',title:'海外衍生品交易实绩（月度流量·风险偏好溢出）'},
 ];
-const GATED=['futoi','levetf','els','dls','cfd','ovsderiv','nbloan','mmf','stockfund'];
-function activeS(){return S.filter(s=>!GATED.includes(s.key)||(SER[s.key]&&SER[s.key].d&&SER[s.key].d.length))}
+const GATED=['futoi','levetf','els','dls','nbloan','mmf','stockfund','yetakrp'];
+function activeS(){return S.filter(s=>s.divider||!GATED.includes(s.key)||(SER[s.key]&&SER[s.key].d&&SER[s.key].d.length))}
 const freqLabel=f=>f==='D'?'日频':f==='Q'?'季频':'月频';
 
 /* ================= 图表 ================= */
@@ -197,22 +217,29 @@ function dualChart(id,labels,lv,yy,color){
     y1:{position:'right',ticks:{...axFont,callback:v=>tick(v)+'%'},grid:{display:false}}}}});
 }
 function ratioChart(id,labels,vals){
-  mkChart(id,{type:'line',data:{labels,datasets:[{data:vals,borderColor:'#A8721C',backgroundColor:'rgba(168,114,28,.08)',fill:true,borderWidth:1.6,pointRadius:0,spanGaps:true}]},
+  const ds=[{data:vals,borderColor:'#A8721C',backgroundColor:'rgba(168,114,28,.08)',fill:true,borderWidth:1.6,pointRadius:0,spanGaps:true,yAxisID:'y',label:'占市值'}];
+  const ks=labels.map(dt=>kospiAtDate(dt));
+  const hasK=ks.some(x=>x!=null);
+  if(hasK)ds.push({data:ks,borderColor:'rgba(150,148,140,.55)',borderWidth:1.1,pointRadius:0,spanGaps:true,fill:false,yAxisID:'y2',label:'KOSPI'});
+  const sc={x:{ticks:{...axFont,maxTicksLimit:10,autoSkip:true},grid:{display:false}},
+    y:{ticks:{...axFont,callback:v=>tick(v)+'%'},grid:{color:'#E9EEF5'}}};
+  if(hasK)sc.y2={position:'right',ticks:{...axFont,color:'#A5A29A',callback:v=>tick(v)},grid:{display:false}};
+  mkChart(id,{type:'line',data:{labels,datasets:ds},
   options:{responsive:true,maintainAspectRatio:false,animation:false,
-   plugins:{legend:{display:false},tooltip:{titleFont:{family:mono},bodyFont:{family:mono},callbacks:{label:c=>` 占市值 ${c.parsed.y==null?'—':c.parsed.y.toFixed(2)+'%'}`}}},
-   scales:{x:{ticks:{...axFont,maxTicksLimit:10,autoSkip:true},grid:{display:false}},
-    y:{ticks:{...axFont,callback:v=>tick(v)+'%'},grid:{color:'#E9EEF5'}}}}});
+   plugins:{legend:{display:false},tooltip:{titleFont:{family:mono},bodyFont:{family:mono},callbacks:{label:c=>c.dataset.yAxisID==='y2'?` KOSPI ${c.parsed.y==null?'—':tick(c.parsed.y)}`:` 占市值 ${c.parsed.y==null?'—':c.parsed.y.toFixed(2)+'%'}`}}},
+   scales:sc}});
 }
 
 /* ================= 渲染 ================= */
 function buildCards(){
   document.getElementById('rows').innerHTML=activeS().map(s=>{
+    if(s.divider)return `<div class="secdiv"><span>${s.label}</span></div>`;
     if(s.type==='ratio')return `<div class="card"><div class="chead"><span class="cnum">10</span><span class="ctitle">${s.title}</span><span class="freq" id="freq-forced"></span><div class="stats" id="stats-forced"></div></div>
       <div class="chlbl">比例时序（%）</div><div class="cv" style="height:260px"><canvas id="ch-forced"></canvas></div></div>`;
     return `<div class="card" id="card-${s.key}"><div class="chead"><span class="cnum">${String(s.no).padStart(2,'0')}</span><span class="ctitle">${s.title}</span><span class="freq" id="freq-${s.key}"></span><div class="stats" id="stats-${s.key}"></div></div>
      <div class="charts">
       <div><div class="chlbl">总额（左轴，万亿韩元）＋ YoY（右轴，%）</div><div class="cv"><canvas id="lv-${s.key}"></canvas><div class="nodata" id="nd1-${s.key}" style="display:none"></div></div></div>
-      <div><div class="chlbl">占KOSPI总市值（%）</div><div class="cv"><canvas id="rt-${s.key}"></canvas><div class="nodata" id="nd2-${s.key}" style="display:none"></div></div></div>
+      <div><div class="chlbl">占KOSPI总市值（%，左）＋ KOSPI指数（灰，右）</div><div class="cv"><canvas id="rt-${s.key}"></canvas><div class="nodata" id="nd2-${s.key}" style="display:none"></div></div></div>
      </div></div>`;
   }).join('');
 }
@@ -259,7 +286,7 @@ function buildTape(){
     const d=SER[k];if(!d)return '';const {v,i}=last(d.v);const y=yoyLatest(d.d,d.v);
     return `<div class="chip"><div class="k">${n} · ${d.d[i]}</div><div class="v">${fmt(v)}<small> 万亿</small></div><span class="y ${pillCls(y)}">YoY ${pct(y)}</span></div>`}).join('');
 }
-function renderAll(){buildTape();activeS().forEach(s=>s.type==='ratio'?renderForced():renderSeries(s))}
+function renderAll(){buildTape();activeS().forEach(s=>{if(s.divider)return;s.type==='ratio'?renderForced():renderSeries(s)})}
 
 initFromRaw();
 const ext=applyExternal();
