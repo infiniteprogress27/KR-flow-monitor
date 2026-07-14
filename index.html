@@ -79,6 +79,10 @@ button:disabled{background:#B9C2D0;cursor:wait}
   <tr><td>活期 / 定期·储蓄性存款</td><td>ECOS 104Y015「存款银行韩元存款（按种类·月末余额）」· 月频 · 1990年起</td></tr>
   <tr><td>KOSPI总市值</td><td>ECOS 802Y001（日频，近两年逐日）＋ 901Y014（月频，全历史）拼接 · 交易所源 · 比率按当月最后交易日对齐</td></tr>
   <tr><td>预托金/融资/回购/垫付欠款/CMA</td><td>内置协会官网底稿（2000-01～2026-06）＋ ECOS 901Y056「股市周边资金动向」增量自动补新</td></tr>
+  <tr><td>期货未平仓名义（11）</td><td>金融委「파생상품시세정보」선물시세 · 日频 · 名义规模＝未平仓合约×收盘价×乘数（KOSPI200为25万韩元/点，个股期货为10股），跨到期月加总，剔除迷你/周度/价差合约 · 2020年起</td></tr>
+  <tr><td>杠杆ETF总市值（12）</td><td>金融委「증권상품시세정보」ETF시세 · 日频 · 名称含「레버리지」的全部上市ETF市值加总（本土多头杠杆系）· 2020年起</td></tr>
+  <tr><td>ELS/ELB发行额（13）</td><td>协会「getELSAndELBInfo」 · 按月加总的发行金额（流量口径，非存量余额；存量在预托决算院SEIBro，二期接入）</td></tr>
+  <tr><td>CFD名目余额（14）</td><td>协会FreeSIS月度披露（2023年SG事件后强制公开）· 无API，脚本内CFD_MANUAL数组手动维护</td></tr>
   <tr><td>其他贷款（BOK月度）</td><td>ECOS 151Y005「存款受理机构家庭贷款（按用途·月末余额）」其他贷款项＝非抵押部分（信用贷/负存折等빚투主通道）· 月频 · 与03B之差即住房抵押贷款</td></tr>
   <tr><td>家庭贷款（BOK月度）</td><td>ECOS 104Y016「存款银行贷款（月末余额）」家庭贷款项 · 月频 · 与季度家庭信用互为月度先行/季度定盘关系</td></tr>
   <tr><td>股票质押 / 强平比例 / 家庭信用</td><td>内置底稿（协会FreeSIS与韩银无对应开放接口项 / 季频），更新需官网下载</td></tr>
@@ -113,6 +117,8 @@ function applyExternal(){
   ['demand','time','hhloan','otherloan'].forEach(k=>{if(X[k]&&X[k].d&&X[k].d.length)SER[k]=X[k]});
   if(X.funds)Object.keys(X.funds).forEach(k=>{const s=X.funds[k];
     if(s&&s.d&&s.d.length&&(s.f==='D'||!SER[k]||s.d.length>=SER[k].d.length))SER[k]=s});
+  if(X.deriv)Object.keys(X.deriv).forEach(k=>{const s=X.deriv[k];
+    if(s&&s.d&&s.d.length)SER[k]=s});
   return true;
 }
 
@@ -156,7 +162,12 @@ const S=[
  {no:8,key:'jiya',title:'股票质押借款余额',hot:1},
  {no:9,key:'misu',title:'垫付欠款余额',hot:1},
  {no:10,key:'forced',title:'强制平仓 ÷ 垫付欠款',type:'ratio'},
+ {no:11,key:'futoi',title:'期货未平仓名义规模（KOSPI200＋三星电子＋SK海力士）',hot:1},
+ {no:12,key:'levetf',title:'本土杠杆ETF总市值（레버리지系合计）',hot:1},
+ {no:13,key:'els',title:'ELS/ELB发行额（月度流量·结构化产品需求）'},
+ {no:14,key:'cfd',title:'CFD名目余额（月频·手动维护）'},
 ];
+function activeS(){return S.filter(s=>+s.no<11||(SER[s.key]&&SER[s.key].d&&SER[s.key].d.length))}
 const freqLabel=f=>f==='D'?'日频':f==='Q'?'季频':'月频';
 
 /* ================= 图表 ================= */
@@ -185,7 +196,7 @@ function ratioChart(id,labels,vals){
 
 /* ================= 渲染 ================= */
 function buildCards(){
-  document.getElementById('rows').innerHTML=S.map(s=>{
+  document.getElementById('rows').innerHTML=activeS().map(s=>{
     if(s.type==='ratio')return `<div class="card"><div class="chead"><span class="cnum">10</span><span class="ctitle">${s.title}</span><span class="freq" id="freq-forced"></span><div class="stats" id="stats-forced"></div></div>
       <div class="chlbl">比例时序（%）</div><div class="cv" style="height:260px"><canvas id="ch-forced"></canvas></div></div>`;
     return `<div class="card" id="card-${s.key}"><div class="chead"><span class="cnum">${String(s.no).padStart(2,'0')}</span><span class="ctitle">${s.title}</span><span class="freq" id="freq-${s.key}"></span><div class="stats" id="stats-${s.key}"></div></div>
@@ -238,7 +249,7 @@ function buildTape(){
     const d=SER[k];if(!d)return '';const {v,i}=last(d.v);const y=yoyLatest(d.d,d.v);
     return `<div class="chip"><div class="k">${n} · ${d.d[i]}</div><div class="v">${fmt(v)}<small> 万亿</small></div><span class="y ${pillCls(y)}">YoY ${pct(y)}</span></div>`}).join('');
 }
-function renderAll(){buildTape();S.forEach(s=>s.type==='ratio'?renderForced():renderSeries(s))}
+function renderAll(){buildTape();activeS().forEach(s=>s.type==='ratio'?renderForced():renderSeries(s))}
 
 initFromRaw();
 const ext=applyExternal();
