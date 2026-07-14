@@ -36,7 +36,7 @@ ANCHOR = {"yetak":121.6, "yungja":37.3, "jiya":25.5, "rp":108.8, "misu":1.3, "cm
 
 
 # 合理区间(万亿韩元): 数量级校准的硬约束
-RANGE = {"mcap":(800,12000),"demand":(200,2000),"time":(400,3000),"hhloan":(600,2500),"otherloan":(80,1200),"futoi":(10,800),"levetf":(2,200),"els":(0.2,40),"cfd":(0.3,40),"nbloan":(80,900),"mmf":(30,400),"stockfund":(20,500),"ovsderiv":(30,2000),"dls":(0.05,20),
+RANGE = {"mcap":(800,12000),"kospi":(300,20000),"demand":(200,2000),"time":(400,3000),"hhloan":(600,2500),"otherloan":(80,1200),"futoi":(10,800),"levetf":(2,200),"els":(0.2,40),"nbloan":(80,900),"mmf":(30,400),"stockfund":(20,500),"ovsderiv":(30,2000),"dls":(0.05,20),
          "yetak":(5,400),"yungja":(1,120),"jiya":(1,120),"rp":(5,400),"misu":(0.05,20),"cma":(5,400)}
 def calibrate(key, raw_latest, unit_name):
     """先按单位字段换算, 若落在合理区间直接用; 否则在10的幂里找能落区间的档位"""
@@ -121,7 +121,23 @@ def fetch_mcap():
     if sc is None: raise RuntimeError(f"市值数量级异常: 原始最新值={pairs[-1][1]} 单位={it.get('UNIT_NAME')}")
     d=[p[0] for p in pairs]; v=[round(p[1]*sc,1) for p in pairs]
     print(f"  ✓ {len(d)}个交易日 ({d[0]} ~ {d[-1]}), 最新 {v[-1]:,.0f} 万亿 (原始单位:{it.get('UNIT_NAME')})")
-    return {"d":d,"v":v,"f":"D","src":f"ECOS 802Y001·{it.get('ITEM_NAME','')}"}
+    out_m = {"d":d,"v":v,"f":"D","src":f"ECOS 802Y001·{it.get('ITEM_NAME','')}"}
+    # 顺带抓KOSPI指数(同表, 用于页面对比线)
+    global KOSPI_OUT
+    KOSPI_OUT=None
+    try:
+        it2=next((r for r in items if ("코스피" in (r.get("ITEM_NAME") or "") or "KOSPI" in (r.get("ITEM_NAME") or ""))
+                  and "지수" in (r.get("ITEM_NAME") or "") and "코스닥" not in (r.get("ITEM_NAME") or "")
+                  and "200" not in (r.get("ITEM_NAME") or "")), None)
+        if it2:
+            p2=rows_to_pairs(ecos_series("802Y001","D",it2["ITEM_CODE"],"19950103",YMD))
+            sc2=calibrate("kospi",p2[-1][1],it2.get("UNIT_NAME")) if p2 else None
+            if sc2:
+                KOSPI_OUT={"d":[p[0] for p in p2],"v":[round(p[1]*sc2,2) for p in p2],"f":"D","src":f"ECOS 802Y001·{it2.get('ITEM_NAME','')}"}
+                print(f"  ✓ KOSPI指数 {len(p2)}点 最新 {KOSPI_OUT['v'][-1]:,.2f}")
+        else: dbg("802Y001未识别KOSPI指数项目")
+    except Exception as e: dbg(f"kospi {str(e)[:80]}")
+    return out_m
 
 def fetch_deposits():
     out={}
@@ -363,7 +379,7 @@ def fetch_futoi():
             dbg(f"futoi字段样例: {list(rows[0].keys())}")
             df=date_field(rows[0])
             nm_field=next((k for k in rows[0] if "itmsnm" in k.lower() or k.lower()=="itmsnm"),None) or                      next((k for k in rows[0] if "nm" in k.lower()),None)
-            oi_field=next((k for k in rows[0] if "intrst" in k.lower()),None)
+            oi_field=next((k for k in rows[0] if "opnint" in k.lower() or "intrst" in k.lower()),None)
             cl_field=next((k for k in rows[0] if k.lower()=="clpr"),None) or                      next((k for k in rows[0] if "clpr" in k.lower()),None)
             if not (df and nm_field and oi_field and cl_field):
                 dbg(f"futoi字段嗅探失败 df={df} nm={nm_field} oi={oi_field} cl={cl_field}"); return {}
@@ -413,6 +429,11 @@ def fetch_levetf():
     vv=[round(x*sc,2) for x in raw]
     print(f"  ✓ levetf 日频 {len(dd)}点 ({dd[0]}~{dd[-1]}) 最新{vv[-1]:,.1f}万亿")
     return {"levetf":{"d":dd,"v":vv,"f":"D","src":"金融委·ETF시세 名称含레버리지 市值加总"}}
+
+def _ymkey(raw):
+    t=re.sub(r"\\D","",str(raw))
+    if len(t)>=6 and t[:2] in ("19","20"): return f"{t[:4]}-{t[4:6]}"
+    return None
 
 def fetch_fund2():
     print("· 基金净资产(MMF/股票型, 협회 getFundTotalNetEssetInfo)…", flush=True)
@@ -500,13 +521,13 @@ def fetch_dls():
         dbg(f"dls {str(e)[:100]}"); return {}
     if not rows: return {}
     dbg(f"dls字段样例: {list(rows[0].keys())}")
-    df=date_field(rows[0])
+    dbg(f"dls首行: {str(rows[0])[:180]}")
     amt=next((k for k in rows[0] if "isu" in k.lower() and "amt" in k.lower()),None) or \
         next((k for k in rows[0] if k.lower()=="amt"),None) or \
         next((k for k in rows[0] if "amt" in k.lower()),None)
     ctg=next((k for k in rows[0] if "dlbdls" in k.lower() or "dlsdlb" in k.lower()),None) or \
         next((k for k in rows[0] if "ctg" in k.lower()),None)
-    if not df or not amt: dbg(f"dls字段嗅探失败 df={df} amt={amt}"); return {}
+    if not amt: dbg("dls未找到金额字段"); return {}
     vals=sorted({str(r.get(ctg,"")) for r in rows}) if ctg else []
     if ctg: dbg(f"dls分类{ctg}取值: {vals[:10]}")
     dls_val=next((v for v in vals if "DLS" in v.upper() or "파생결합증권" in v),None) if ctg else None
@@ -515,9 +536,8 @@ def fetch_dls():
         if ctg and dls_val is not None and str(r.get(ctg,""))!=dls_val: continue
         v=_num(r.get(amt))
         if v is None: continue
-        t=str(r.get(df,""))
-        if len(t)!=8: continue
-        kd=f"{t[:4]}-{t[4:6]}"
+        kd=_ymkey(r.get("basDt"))
+        if not kd: continue
         monthly[kd]=monthly.get(kd,0.0)+v
     if not monthly: return {}
     dd=sorted(monthly); raw=[monthly[x] for x in dd]
@@ -537,16 +557,10 @@ def fetch_els():
         dbg(f"els {str(e)[:100]}"); return {}
     if not rows: return {}
     dbg(f"els字段样例: {list(rows[0].keys())}")
-    df=date_field(rows[0])
-    ym_field=None
-    if not df:
-        for k,v in rows[0].items():
-            sv=str(v)
-            if len(sv)==6 and sv.isdigit() and sv.startswith(("19","20")): ym_field=k; break
+    dbg(f"els首行: {str(rows[0])[:180]}")
     amt=next((k for k in rows[0] if "isu" in k.lower() and "amt" in k.lower()),None) or         next((k for k in rows[0] if "amt" in k.lower()),None)
     ctg=next((k for k in rows[0] if "ctg" in k.lower() or "tpcd" in k.lower() or "scrt" in k.lower()),None)
-    if not (df or ym_field) or not amt:
-        dbg(f"els字段嗅探失败 df={df} ym={ym_field} amt={amt}"); return {}
+    if not amt: dbg("els未找到金额字段"); return {}
     monthly={}
     for r in rows:
         if ctg:
@@ -554,14 +568,8 @@ def fetch_els():
             if cv and "ELS" not in cv.upper(): continue
         v=_num(r.get(amt))
         if v is None: continue
-        if df:
-            t=str(r.get(df,""))
-            if len(t)!=8: continue
-            key=f"{t[:4]}-{t[4:6]}"
-        else:
-            t=str(r.get(ym_field,""))
-            if len(t)!=6: continue
-            key=f"{t[:4]}-{t[4:6]}"
+        key=_ymkey(r.get("basDt"))
+        if not key: continue
         monthly[key]=monthly.get(key,0.0)+v
     if not monthly: return {}
     dd=sorted(monthly); raw=[monthly[x] for x in dd]
@@ -571,17 +579,12 @@ def fetch_els():
     print(f"  ✓ els 月度发行 {len(dd)}点 ({dd[0]}~{dd[-1]}) 最新{vv[-1]:,.2f}万亿")
     return {"els":{"d":dd,"v":vv,"f":"M","src":"협회·getELSAndELBInfo ELS发行额按月加总"}}
 
-CFD_MANUAL = []   # CFD名目余额月度手动维护: 形如 [("2025-12", 2.8), ("2026-01", 3.1)]
-
 def fetch_deriv():
     out={}
     if not DATA_GO_KR_KEY.strip(): return out
-    for fn in (fetch_futoi, fetch_levetf, fetch_els, fetch_dls, fetch_fund2, fetch_ovsderiv):
+    for fn in (fetch_futoi, fetch_levetf, fetch_els, fetch_dls, fetch_fund2):
         try: out.update(fn())
         except Exception as e: dbg(f"{fn.__name__} 顶层异常 {str(e)[:120]}")
-    if CFD_MANUAL:
-        dd=[x[0] for x in CFD_MANUAL]; vv=[x[1] for x in CFD_MANUAL]
-        out["cfd"]={"d":dd,"v":vv,"f":"M","src":"협회FreeSIS·CFD名目余额(手动维护)"}
     return out
 
 def fetch_funds_daily():
@@ -662,7 +665,9 @@ def fetch_funds_daily():
 # ---------------------------- 主流程 ----------------------------
 def main():
     out={"meta":{"fetched_at":dt.datetime.now().strftime("%Y-%m-%d %H:%M"),"notes":[],"debug":DEBUG}}
-    try: out["mcap"]=fetch_mcap()
+    try:
+        out["mcap"]=fetch_mcap()
+        if KOSPI_OUT: out["kospi"]=KOSPI_OUT
     except Exception as e: print(f"  ✗ 市值失败: {e}"); out["meta"]["notes"].append(f"mcap失败:{e}")
     try: out.update(fetch_deposits())
     except Exception as e: print(f"  ✗ 存款失败: {e}"); out["meta"]["notes"].append(f"存款失败:{e}")
@@ -684,9 +689,9 @@ def main():
     def rep(k,v):
         if v and v.get("d"): print(f"  {k:8s} {v['f']} {len(v['d']):>6}点  {v['d'][0]} ~ {v['d'][-1]}  最新={v['v'][-1]:,}")
         else: print(f"  {k:8s} 缺失")
-    rep("mcap",out.get("mcap")); rep("demand",out.get("demand")); rep("time",out.get("time")); rep("hhloan",out.get("hhloan")); rep("nbloan",out.get("nbloan")); rep("otherloan",out.get("otherloan"))
+    rep("mcap",out.get("mcap")); rep("kospi",out.get("kospi")); rep("demand",out.get("demand")); rep("time",out.get("time")); rep("hhloan",out.get("hhloan")); rep("nbloan",out.get("nbloan")); rep("otherloan",out.get("otherloan"))
     for k in ("yetak","yungja","jiya","rp","misu","cma","forced"): rep(k,(out.get("funds") or {}).get(k))
-    for k in ("futoi","levetf","els","dls","cfd","mmf","stockfund","ovsderiv"): rep(k,(out.get("deriv") or {}).get(k))
+    for k in ("futoi","levetf","els","dls","mmf","stockfund"): rep(k,(out.get("deriv") or {}).get(k))
     print("==================================\n")
     with open("data.js","w",encoding="utf-8") as f:
         f.write("window.KOREA_DATA=");json.dump(out,f,ensure_ascii=False,separators=(",",":"));f.write(";")
