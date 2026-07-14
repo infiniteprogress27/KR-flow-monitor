@@ -36,7 +36,7 @@ ANCHOR = {"yetak":121.6, "yungja":37.3, "jiya":25.5, "rp":108.8, "misu":1.3, "cm
 
 
 # 合理区间(万亿韩元): 数量级校准的硬约束
-RANGE = {"mcap":(800,12000),"demand":(200,2000),"time":(400,3000),"hhloan":(600,2500),"otherloan":(80,1200),
+RANGE = {"mcap":(800,12000),"demand":(200,2000),"time":(400,3000),"hhloan":(600,2500),"otherloan":(80,1200),"futoi":(10,800),"levetf":(2,200),"els":(0.2,40),"cfd":(0.3,40),
          "yetak":(5,400),"yungja":(1,120),"jiya":(1,120),"rp":(5,400),"misu":(0.05,20),"cma":(5,400)}
 def calibrate(key, raw_latest, unit_name):
     """先按单位字段换算, 若落在合理区间直接用; 否则在10的幂里找能落区间的档位"""
@@ -256,9 +256,13 @@ OP_CANDS = {  # 官方Swagger确认的真实操作名
   "credit":["getGrantingOfCreditBalanceInfo"],        # 신용공여잔고추이(日频): 融资/质押
   "cma":   ["getCMAStatus"],                          # 일자별CMA현황(日频)
 }
-def gk(op, page=1, rows=5000):
-    r = requests.get(f"{G}/{op}", params={"serviceKey":DATA_GO_KR_KEY,"pageNo":page,
-        "numOfRows":rows,"resultType":"json"}, timeout=90)
+DERIV_BASE = "https://apis.data.go.kr/1160100/service/GetDerivativeProductInfoService"
+SECPRD_BASE = "https://apis.data.go.kr/1160100/service/GetSecuritiesProductInfoService"
+
+def gk(op, page=1, rows=5000, extra=None, base=None):
+    p = {"serviceKey":DATA_GO_KR_KEY,"pageNo":page,"numOfRows":rows,"resultType":"json"}
+    if extra: p.update(extra)
+    r = requests.get(f"{base or G}/{op}", params=p, timeout=90)
     if r.status_code!=200: raise RuntimeError(f"HTTP{r.status_code} {r.text[:80]}")
     try: j=r.json()
     except ValueError: raise RuntimeError("非JSON:"+r.text[:100])
@@ -295,11 +299,11 @@ def date_field(item):
         if len(s)==8 and s.isdigit() and s.startswith(("19","20")): return k
     return None
 
-def pull_all(op,total):
+def pull_all(op,total,extra=None,base=None):
     items=[]; page=1
     while len(items)<total:
-        chunk,_=gk(op,page,10000); items+=chunk; page+=1
-        if page>50: break
+        chunk,_=gk(op,page,10000,extra,base); items+=chunk; page+=1
+        if page>60: break
         time.sleep(0.3)
     return items
 
@@ -325,6 +329,136 @@ def series_from_items(items, val_kws, anchor_key):
     sc=snap_scale(v[-1],ANCHOR.get(anchor_key,100))
     if sc is None: return None
     return {"d":d,"v":[round(x*sc,3) for x in v],"f":"D","src":f"data.go.kr 협회·{fld}"}
+
+def _num(x):
+    try: return float(str(x).replace(",",""))
+    except (TypeError,ValueError): return None
+
+def fetch_futoi():
+    print("· 期货未平仓名义规模(日频, 파생상품시세정보)…", flush=True)
+    EXCL=("미니","마이크","스프레드","옵션","위클리","섹터","배당","변동","야간","유로")
+    groups=[("코스피200",250000.0),("삼성전자",10.0),("SK하이닉스",10.0)]
+    daily={}
+    oi_field=None; nm_field=None; df=None
+    for kw,mult in groups:
+        try:
+            items,total=gk("getStockFuturesPriceInfo",1,3,{"likeItmsNm":kw},DERIV_BASE)
+            if total==0: dbg(f"futoi:{kw} total=0"); continue
+            rows=pull_all("getStockFuturesPriceInfo",total,{"likeItmsNm":kw},DERIV_BASE)
+        except Exception as e:
+            dbg(f"futoi:{kw} {str(e)[:100]}"); continue
+        if not rows: continue
+        if oi_field is None:
+            dbg(f"futoi字段样例: {list(rows[0].keys())}")
+            df=date_field(rows[0])
+            nm_field=next((k for k in rows[0] if "itmsnm" in k.lower() or k.lower()=="itmsnm"),None) or                      next((k for k in rows[0] if "nm" in k.lower()),None)
+            oi_field=next((k for k in rows[0] if "intrst" in k.lower()),None)
+            cl_field=next((k for k in rows[0] if k.lower()=="clpr"),None) or                      next((k for k in rows[0] if "clpr" in k.lower()),None)
+            if not (df and nm_field and oi_field and cl_field):
+                dbg(f"futoi字段嗅探失败 df={df} nm={nm_field} oi={oi_field} cl={cl_field}"); return {}
+        n=0
+        for r in rows:
+            nm=str(r.get(nm_field,""))
+            if kw not in nm or "선물" not in nm: continue
+            if any(x in nm for x in EXCL): continue
+            t=str(r.get(df,""))
+            oi=_num(r.get(oi_field)); cl=_num(r.get(cl_field))
+            if len(t)!=8 or oi is None or cl is None: continue
+            key=f"{t[:4]}-{t[4:6]}-{t[6:8]}"
+            daily[key]=daily.get(key,0.0)+cl*mult*oi
+            n+=1
+        dbg(f"futoi:{kw} 纳入{n}行")
+    if not daily: return {}
+    dd=sorted(daily); raw=[daily[x] for x in dd]
+    sc=calibrate("futoi", raw[-1], "원")
+    if sc is None: dbg(f"futoi数量级异常 最新原始={raw[-1]}"); return {}
+    vv=[round(x*sc,2) for x in raw]
+    print(f"  ✓ futoi 日频 {len(dd)}点 ({dd[0]}~{dd[-1]}) 最新{vv[-1]:,.1f}万亿")
+    return {"futoi":{"d":dd,"v":vv,"f":"D","src":"金融委·선물시세 K200×25万+个股×10 跨月加总"}}
+
+def fetch_levetf():
+    print("· 杠杆ETF总市值(日频, 증권상품시세정보)…", flush=True)
+    try:
+        items,total=gk("getETFPriceInfo",1,3,{"likeItmsNm":"레버리지"},SECPRD_BASE)
+        if total==0: dbg("levetf total=0"); return {}
+        rows=pull_all("getETFPriceInfo",total,{"likeItmsNm":"레버리지"},SECPRD_BASE)
+    except Exception as e:
+        dbg(f"levetf {str(e)[:100]}"); return {}
+    if not rows: return {}
+    dbg(f"levetf字段样例: {list(rows[0].keys())}")
+    df=date_field(rows[0])
+    mk=next((k for k in rows[0] if "mrkttotamt" in k.lower()),None) or        next((k for k in rows[0] if "tot" in k.lower() and "amt" in k.lower()),None)
+    if not (df and mk): dbg(f"levetf字段嗅探失败 df={df} mk={mk}"); return {}
+    daily={}
+    for r in rows:
+        t=str(r.get(df,"")); v=_num(r.get(mk))
+        if len(t)!=8 or v is None: continue
+        key=f"{t[:4]}-{t[4:6]}-{t[6:8]}"
+        daily[key]=daily.get(key,0.0)+v
+    if not daily: return {}
+    dd=sorted(daily); raw=[daily[x] for x in dd]
+    sc=calibrate("levetf", raw[-1], "원")
+    if sc is None: dbg(f"levetf数量级异常 最新原始={raw[-1]}"); return {}
+    vv=[round(x*sc,2) for x in raw]
+    print(f"  ✓ levetf 日频 {len(dd)}点 ({dd[0]}~{dd[-1]}) 最新{vv[-1]:,.1f}万亿")
+    return {"levetf":{"d":dd,"v":vv,"f":"D","src":"金融委·ETF시세 名称含레버리지 市值加总"}}
+
+def fetch_els():
+    print("· ELS/ELB发行动向(现有协会服务)…", flush=True)
+    try:
+        items,total=gk("getELSAndELBInfo",1,3)
+        if total==0: dbg("els total=0"); return {}
+        rows=pull_all("getELSAndELBInfo",total)
+    except Exception as e:
+        dbg(f"els {str(e)[:100]}"); return {}
+    if not rows: return {}
+    dbg(f"els字段样例: {list(rows[0].keys())}")
+    df=date_field(rows[0])
+    ym_field=None
+    if not df:
+        for k,v in rows[0].items():
+            sv=str(v)
+            if len(sv)==6 and sv.isdigit() and sv.startswith(("19","20")): ym_field=k; break
+    amt=next((k for k in rows[0] if "isu" in k.lower() and "amt" in k.lower()),None) or         next((k for k in rows[0] if "amt" in k.lower()),None)
+    ctg=next((k for k in rows[0] if "ctg" in k.lower() or "tpcd" in k.lower() or "scrt" in k.lower()),None)
+    if not (df or ym_field) or not amt:
+        dbg(f"els字段嗅探失败 df={df} ym={ym_field} amt={amt}"); return {}
+    monthly={}
+    for r in rows:
+        if ctg:
+            cv=str(r.get(ctg,""))
+            if cv and "ELS" not in cv.upper(): continue
+        v=_num(r.get(amt))
+        if v is None: continue
+        if df:
+            t=str(r.get(df,""))
+            if len(t)!=8: continue
+            key=f"{t[:4]}-{t[4:6]}"
+        else:
+            t=str(r.get(ym_field,""))
+            if len(t)!=6: continue
+            key=f"{t[:4]}-{t[4:6]}"
+        monthly[key]=monthly.get(key,0.0)+v
+    if not monthly: return {}
+    dd=sorted(monthly); raw=[monthly[x] for x in dd]
+    sc=calibrate("els", raw[-2] if len(raw)>1 else raw[-1], "원")
+    if sc is None: dbg(f"els数量级异常 最新原始={raw[-1]}"); return {}
+    vv=[round(x*sc,2) for x in raw]
+    print(f"  ✓ els 月度发行 {len(dd)}点 ({dd[0]}~{dd[-1]}) 最新{vv[-1]:,.2f}万亿")
+    return {"els":{"d":dd,"v":vv,"f":"M","src":"협회·getELSAndELBInfo ELS发行额按月加总"}}
+
+CFD_MANUAL = []   # CFD名目余额月度手动维护: 形如 [("2025-12", 2.8), ("2026-01", 3.1)]
+
+def fetch_deriv():
+    out={}
+    if not DATA_GO_KR_KEY.strip(): return out
+    for fn in (fetch_futoi, fetch_levetf, fetch_els):
+        try: out.update(fn())
+        except Exception as e: dbg(f"{fn.__name__} 顶层异常 {str(e)[:120]}")
+    if CFD_MANUAL:
+        dd=[x[0] for x in CFD_MANUAL]; vv=[x[1] for x in CFD_MANUAL]
+        out["cfd"]={"d":dd,"v":vv,"f":"M","src":"협회FreeSIS·CFD名目余额(手动维护)"}
+    return out
 
 def fetch_funds_daily():
     print("· 协会资金面(日频, data.go.kr)…", flush=True)
@@ -420,6 +554,7 @@ def main():
             if k not in funds: funds[k]=v   # 日频优先, 月频补缺
     except Exception as e: print(f"  ✗ ECOS协会月频失败: {e}")
     out["funds"]=funds
+    out["deriv"] = fetch_deriv()
 
     print("\n========== 序列体检报告 ==========")
     def rep(k,v):
@@ -427,6 +562,7 @@ def main():
         else: print(f"  {k:8s} 缺失")
     rep("mcap",out.get("mcap")); rep("demand",out.get("demand")); rep("time",out.get("time")); rep("hhloan",out.get("hhloan")); rep("otherloan",out.get("otherloan"))
     for k in ("yetak","yungja","jiya","rp","misu","cma","forced"): rep(k,(out.get("funds") or {}).get(k))
+    for k in ("futoi","levetf","els","cfd"): rep(k,(out.get("deriv") or {}).get(k))
     print("==================================\n")
     with open("data.js","w",encoding="utf-8") as f:
         f.write("window.KOREA_DATA=");json.dump(out,f,ensure_ascii=False,separators=(",",":"));f.write(";")
