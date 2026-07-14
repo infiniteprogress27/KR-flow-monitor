@@ -82,7 +82,7 @@ button:disabled{background:#B9C2D0;cursor:wait}
   <tr><td>KOSPI总市值</td><td>ECOS 802Y001（日频，近两年逐日）＋ 901Y014（月频，全历史）拼接 · 交易所源 · 比率按当月最后交易日对齐</td></tr>
   <tr><td>预托金/融资/回购/垫付欠款/CMA</td><td>内置协会官网底稿（2000-01～2026-06）＋ ECOS 901Y056「股市周边资金动向」增量自动补新</td></tr>
   <tr><td>预托金＋RP（4A）</td><td>04与06按交易日对齐加总 · 客户在券商处的现金总弹药（未上保险栓+已上保险栓）· 消除两者互相搬家造成的单线噪音</td></tr>
-  <tr><td>KOSPI指数灰线</td><td>ECOS 802Y001 코스피지수 · 日频 · 各占市值图右二轴，仅作走势对比</td></tr>
+  <tr><td>KOSPI指数灰线</td><td>ECOS 802Y001 코스피지수 · 日频 · 各总额图右二轴（浅灰），仅作走势对比</td></tr>
   <tr><td>非银行家庭贷款（3D）</td><td>ECOS 151Y002 비은행예금취급기관（储蓄银行/相互金融等二金融圈）家庭贷款末残 · 月频 · 与03B对照读监管套利式加杠杆（银行降+非银升）</td></tr>
   <tr><td>MMF/股票型基金（5B/5C）</td><td>协会「getFundTotalNetEssetInfo」按基金类型净资产 · MMF与CMA/预托金互为资金分流；股票型基金为间接入市通道</td></tr>
   <tr><td>DLS/DLB发行额（13B）</td><td>协会「getDLSAndDLBInfo」月度加总（流量口径）</td></tr>
@@ -206,28 +206,28 @@ const tick=v=>{v=Number(v);v=parseFloat(v.toPrecision(12));return Math.abs(v)>=1
 const axFont={font:{family:mono,size:11},color:'#5E6D86'};
 function mkChart(id,cfg){if(charts[id])charts[id].destroy();charts[id]=new Chart(document.getElementById(id),cfg)}
 function dualChart(id,labels,lv,yy,color){
-  mkChart(id,{type:'line',data:{labels,datasets:[
+  const ds=[
    {label:'总额(万亿韩元)',data:lv,borderColor:color,borderWidth:1.6,pointRadius:0,spanGaps:true,yAxisID:'y'},
-   {label:'YoY(%)',data:yy,borderColor:'#9AA7BC',borderDash:[4,3],borderWidth:1.1,pointRadius:0,spanGaps:true,yAxisID:'y1'}]},
-  options:{responsive:true,maintainAspectRatio:false,animation:false,interaction:{mode:'index',intersect:false},
-   plugins:{legend:{display:true,labels:{boxWidth:16,boxHeight:2,font:{size:11},color:'#5E6D86'}},
-    tooltip:{titleFont:{family:mono},bodyFont:{family:mono},callbacks:{label:c=>c.dataset.label.includes('YoY')?` YoY ${c.parsed.y==null?'—':c.parsed.y.toFixed(1)+'%'}`:` 总额 ${fmt(c.parsed.y)} 万亿`}}},
-   scales:{x:{ticks:{...axFont,maxTicksLimit:10,autoSkip:true},grid:{display:false}},
-    y:{position:'left',ticks:{...axFont,callback:v=>tick(v)},grid:{color:'#E9EEF5'}},
-    y1:{position:'right',ticks:{...axFont,callback:v=>tick(v)+'%'},grid:{display:false}}}}});
-}
-function ratioChart(id,labels,vals){
-  const ds=[{data:vals,borderColor:'#A8721C',backgroundColor:'rgba(168,114,28,.08)',fill:true,borderWidth:1.6,pointRadius:0,spanGaps:true,yAxisID:'y',label:'占市值'}];
+   {label:'YoY(%)',data:yy,borderColor:'#9AA7BC',borderDash:[4,3],borderWidth:1.1,pointRadius:0,spanGaps:true,yAxisID:'y1'}];
   const ks=labels.map(dt=>kospiAtDate(dt));
   const hasK=ks.some(x=>x!=null);
-  if(hasK)ds.push({data:ks,borderColor:'rgba(150,148,140,.55)',borderWidth:1.1,pointRadius:0,spanGaps:true,fill:false,yAxisID:'y2',label:'KOSPI'});
+  if(hasK)ds.push({label:'KOSPI指数',data:ks,borderColor:'rgba(158,155,146,.5)',borderWidth:1.1,pointRadius:0,spanGaps:true,fill:false,yAxisID:'y2'});
   const sc={x:{ticks:{...axFont,maxTicksLimit:10,autoSkip:true},grid:{display:false}},
-    y:{ticks:{...axFont,callback:v=>tick(v)+'%'},grid:{color:'#E9EEF5'}}};
-  if(hasK)sc.y2={position:'right',ticks:{...axFont,color:'#A5A29A',callback:v=>tick(v)},grid:{display:false}};
+    y:{position:'left',ticks:{...axFont,callback:v=>tick(v)},grid:{color:'#E9EEF5'}},
+    y1:{position:'right',ticks:{...axFont,callback:v=>tick(v)+'%'},grid:{display:false}}};
+  if(hasK)sc.y2={position:'right',ticks:{...axFont,color:'#B0ADA4',callback:v=>tick(v)},grid:{display:false}};
   mkChart(id,{type:'line',data:{labels,datasets:ds},
-  options:{responsive:true,maintainAspectRatio:false,animation:false,
-   plugins:{legend:{display:false},tooltip:{titleFont:{family:mono},bodyFont:{family:mono},callbacks:{label:c=>c.dataset.yAxisID==='y2'?` KOSPI ${c.parsed.y==null?'—':tick(c.parsed.y)}`:` 占市值 ${c.parsed.y==null?'—':c.parsed.y.toFixed(2)+'%'}`}}},
+  options:{responsive:true,maintainAspectRatio:false,animation:false,interaction:{mode:'index',intersect:false},
+   plugins:{legend:{display:true,labels:{boxWidth:16,boxHeight:2,font:{size:11},color:'#5E6D86'}},
+    tooltip:{titleFont:{family:mono},bodyFont:{family:mono},callbacks:{label:c=>c.dataset.label==='KOSPI指数'?` KOSPI ${c.parsed.y==null?'—':tick(c.parsed.y)}`:(c.dataset.label.includes('YoY')?` YoY ${c.parsed.y==null?'—':c.parsed.y.toFixed(1)+'%'}`:` 总额 ${fmt(c.parsed.y)} 万亿`)}}},
    scales:sc}});
+}
+function ratioChart(id,labels,vals){
+  mkChart(id,{type:'line',data:{labels,datasets:[{data:vals,borderColor:'#A8721C',backgroundColor:'rgba(168,114,28,.08)',fill:true,borderWidth:1.6,pointRadius:0,spanGaps:true}]},
+  options:{responsive:true,maintainAspectRatio:false,animation:false,
+   plugins:{legend:{display:false},tooltip:{titleFont:{family:mono},bodyFont:{family:mono},callbacks:{label:c=>` 占市值 ${c.parsed.y==null?'—':c.parsed.y.toFixed(2)+'%'}`}}},
+   scales:{x:{ticks:{...axFont,maxTicksLimit:10,autoSkip:true},grid:{display:false}},
+    y:{ticks:{...axFont,callback:v=>tick(v)+'%'},grid:{color:'#E9EEF5'}}}}});
 }
 
 /* ================= 渲染 ================= */
@@ -238,8 +238,8 @@ function buildCards(){
       <div class="chlbl">比例时序（%）</div><div class="cv" style="height:260px"><canvas id="ch-forced"></canvas></div></div>`;
     return `<div class="card" id="card-${s.key}"><div class="chead"><span class="cnum">${String(s.no).padStart(2,'0')}</span><span class="ctitle">${s.title}</span><span class="freq" id="freq-${s.key}"></span><div class="stats" id="stats-${s.key}"></div></div>
      <div class="charts">
-      <div><div class="chlbl">总额（左轴，万亿韩元）＋ YoY（右轴，%）</div><div class="cv"><canvas id="lv-${s.key}"></canvas><div class="nodata" id="nd1-${s.key}" style="display:none"></div></div></div>
-      <div><div class="chlbl">占KOSPI总市值（%，左）＋ KOSPI指数（灰，右）</div><div class="cv"><canvas id="rt-${s.key}"></canvas><div class="nodata" id="nd2-${s.key}" style="display:none"></div></div></div>
+      <div><div class="chlbl">总额（左轴，万亿）＋ YoY（右轴，%）＋ KOSPI指数（灰，右二轴）</div><div class="cv"><canvas id="lv-${s.key}"></canvas><div class="nodata" id="nd1-${s.key}" style="display:none"></div></div></div>
+      <div><div class="chlbl">占KOSPI总市值（%）</div><div class="cv"><canvas id="rt-${s.key}"></canvas><div class="nodata" id="nd2-${s.key}" style="display:none"></div></div></div>
      </div></div>`;
   }).join('');
 }
