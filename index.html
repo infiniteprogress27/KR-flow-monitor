@@ -276,7 +276,7 @@ function renderSeries(s){
   const mc=mcapAtDate(d.d[i]);const r=(v!=null&&mc)?v/mc*100:null;
   document.getElementById('stats-'+s.key).innerHTML=statHTML(d.d[i],v,y,r);
   document.getElementById('freq-'+s.key).textContent=freqLabel(d.f)+' · '+d.src.split('·')[0];
-  dualChart('lv-'+s.key,d.d,d.v,yoySeries(d.d,d.v),'#24406B');
+  dualChart('lv-'+s.key,d.d,d.v,yoySeries(d.d,d.v),(y!=null&&y>0)?'#C93A36':'#24406B');
   const hasM=MCAP_D||Object.keys(MCAP_M).length;
   if(hasM){const rs=d.d.map((dt,ix)=>{const m=mcapAtDate(dt);return(d.v[ix]!=null&&m)?+(d.v[ix]/m*100).toFixed(3):null});
     if(rs.some(x=>x!=null)){nd2.style.display='none';ratioChart('rt-'+s.key,d.d,rs)}
