@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>韩国股市资金面·杠杆监测台</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hammer.js/2.0.8/hammer.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-zoom/2.0.1/chartjs-plugin-zoom.min.js"></script>
 <style>
 :root{
   --paper:#F3F5F8; --panel:#FFFFFF; --ink:#17263F; --sub:#5E6D86;
@@ -82,7 +84,8 @@ button:disabled{background:#B9C2D0;cursor:wait}
   <tr><td>KOSPI总市值</td><td>ECOS 802Y001（日频，近两年逐日）＋ 901Y014（月频，全历史）拼接 · 交易所源 · 比率按当月最后交易日对齐</td></tr>
   <tr><td>预托金/融资/回购/垫付欠款/CMA</td><td>内置协会官网底稿（2000-01～2026-06）＋ ECOS 901Y056「股市周边资金动向」增量自动补新</td></tr>
   <tr><td>预托金＋RP（4A）</td><td>04与06按交易日对齐加总 · 客户在券商处的现金总弹药（未上保险栓+已上保险栓）· 消除两者互相搬家造成的单线噪音</td></tr>
-  <tr><td>KOSPI指数灰线</td><td>ECOS 802Y001 코스피지수 · 日频 · 各总额图右二轴（浅灰），仅作走势对比</td></tr>
+  <tr><td>KOSPI指数对比线</td><td>ECOS 802Y001 코스피지수 · 日频 · 各总额图右二轴（灰绿·对数刻度），仅作走势对比</td></tr>
+  <tr><td>图表交互</td><td>所有图表支持：滚轮缩放时间轴 · 按住拖动平移 · 触屏双指缩放 · 双击图表复位</td></tr>
   <tr><td>非银行家庭贷款（3D）</td><td>ECOS 151Y002 비은행예금취급기관（储蓄银行/相互金融等二金融圈）家庭贷款末残 · 月频 · 与03B对照读监管套利式加杠杆（银行降+非银升）</td></tr>
   <tr><td>MMF/股票型基金（5B/5C）</td><td>协会「getFundTotalNetEssetInfo」按基金类型净资产 · MMF与CMA/预托金互为资金分流；股票型基金为间接入市通道</td></tr>
   <tr><td>DLS/DLB发行额（13B）</td><td>协会「getDLSAndDLBInfo」月度加总（流量口径）</td></tr>
@@ -204,22 +207,30 @@ const freqLabel=f=>f==='D'?'日频':f==='Q'?'季频':'月频';
 let charts={};
 const tick=v=>{v=Number(v);v=parseFloat(v.toPrecision(12));return Math.abs(v)>=1000?v.toLocaleString('zh-CN'):String(v)};
 const axFont={font:{family:mono,size:11},color:'#5E6D86'};
-function mkChart(id,cfg){if(charts[id])charts[id].destroy();charts[id]=new Chart(document.getElementById(id),cfg)}
+const ZOOM_OPT={pan:{enabled:true,mode:'x',modifierKey:null},zoom:{wheel:{enabled:true,speed:.08},pinch:{enabled:true},drag:{enabled:false},mode:'x'},limits:{x:{minRange:5}}};
+function mkChart(id,cfg){
+  if(charts[id])charts[id].destroy();
+  cfg.options=cfg.options||{};cfg.options.plugins=cfg.options.plugins||{};
+  cfg.options.plugins.zoom=ZOOM_OPT;
+  const el=document.getElementById(id);
+  charts[id]=new Chart(el,cfg);
+  el.ondblclick=()=>charts[id].resetZoom();
+}
 function dualChart(id,labels,lv,yy,color){
   const ds=[
    {label:'总额(万亿韩元)',data:lv,borderColor:color,borderWidth:1.6,pointRadius:0,spanGaps:true,yAxisID:'y'},
    {label:'YoY(%)',data:yy,borderColor:'#9AA7BC',borderDash:[4,3],borderWidth:1.1,pointRadius:0,spanGaps:true,yAxisID:'y1'}];
   const ks=labels.map(dt=>kospiAtDate(dt));
   const hasK=ks.some(x=>x!=null);
-  if(hasK)ds.push({label:'KOSPI指数',data:ks,borderColor:'rgba(158,155,146,.5)',borderWidth:1.1,pointRadius:0,spanGaps:true,fill:false,yAxisID:'y2'});
+  if(hasK)ds.push({label:'KOSPI指数(log)',data:ks,borderColor:'rgba(107,142,111,.85)',borderWidth:1.2,pointRadius:0,spanGaps:true,fill:false,yAxisID:'y2'});
   const sc={x:{ticks:{...axFont,maxTicksLimit:10,autoSkip:true},grid:{display:false}},
     y:{position:'left',ticks:{...axFont,callback:v=>tick(v)},grid:{color:'#E9EEF5'}},
     y1:{position:'right',ticks:{...axFont,callback:v=>tick(v)+'%'},grid:{display:false}}};
-  if(hasK)sc.y2={position:'right',ticks:{...axFont,color:'#B0ADA4',callback:v=>tick(v)},grid:{display:false}};
+  if(hasK)sc.y2={type:'logarithmic',position:'right',ticks:{...axFont,color:'#6B8E6F',maxTicksLimit:6,callback:v=>tick(v)},grid:{display:false}};
   mkChart(id,{type:'line',data:{labels,datasets:ds},
   options:{responsive:true,maintainAspectRatio:false,animation:false,interaction:{mode:'index',intersect:false},
    plugins:{legend:{display:true,labels:{boxWidth:16,boxHeight:2,font:{size:11},color:'#5E6D86'}},
-    tooltip:{titleFont:{family:mono},bodyFont:{family:mono},callbacks:{label:c=>c.dataset.label==='KOSPI指数'?` KOSPI ${c.parsed.y==null?'—':tick(c.parsed.y)}`:(c.dataset.label.includes('YoY')?` YoY ${c.parsed.y==null?'—':c.parsed.y.toFixed(1)+'%'}`:` 总额 ${fmt(c.parsed.y)} 万亿`)}}},
+    tooltip:{titleFont:{family:mono},bodyFont:{family:mono},callbacks:{label:c=>c.dataset.label.startsWith('KOSPI')?` KOSPI ${c.parsed.y==null?'—':tick(c.parsed.y)}`:(c.dataset.label.includes('YoY')?` YoY ${c.parsed.y==null?'—':c.parsed.y.toFixed(1)+'%'}`:` 总额 ${fmt(c.parsed.y)} 万亿`)}}},
    scales:sc}});
 }
 function ratioChart(id,labels,vals){
@@ -238,7 +249,7 @@ function buildCards(){
       <div class="chlbl">比例时序（%）</div><div class="cv" style="height:260px"><canvas id="ch-forced"></canvas></div></div>`;
     return `<div class="card" id="card-${s.key}"><div class="chead"><span class="cnum">${String(s.no).padStart(2,'0')}</span><span class="ctitle">${s.title}</span><span class="freq" id="freq-${s.key}"></span><div class="stats" id="stats-${s.key}"></div></div>
      <div class="charts">
-      <div><div class="chlbl">总额（左轴，万亿）＋ YoY（右轴，%）＋ KOSPI指数（灰，右二轴）</div><div class="cv"><canvas id="lv-${s.key}"></canvas><div class="nodata" id="nd1-${s.key}" style="display:none"></div></div></div>
+      <div><div class="chlbl">总额（左轴，万亿）＋ YoY（右轴，%）＋ KOSPI指数（绿·对数右二轴）</div><div class="cv"><canvas id="lv-${s.key}"></canvas><div class="nodata" id="nd1-${s.key}" style="display:none"></div></div></div>
       <div><div class="chlbl">占KOSPI总市值（%）</div><div class="cv"><canvas id="rt-${s.key}"></canvas><div class="nodata" id="nd2-${s.key}" style="display:none"></div></div></div>
      </div></div>`;
   }).join('');
@@ -292,7 +303,7 @@ initFromRaw();
 const ext=applyExternal();
 buildCards();renderAll();
 document.getElementById('status').textContent = ext
- ? ('数据文件已加载 · 更新于 '+(window.KOREA_DATA.meta&&window.KOREA_DATA.meta.fetched_at||'?')+' · 频率见各卡片徽章 · 再次更新: 运行 python update_data.py 后刷新本页')
+ ? ('数据文件已加载 · 更新于 '+(window.KOREA_DATA.meta&&window.KOREA_DATA.meta.fetched_at||'?')+' · 频率见各卡片徽章 · 图表可滚轮缩放/拖动平移/双击复位 · 再次更新: 运行 python update_data.py 后刷新本页')
  : '当前为内置底稿(协会月频, 截至2026-06) · 获取日频/存款/市值: 把本页与 update_data.py 放同一文件夹, 运行 python update_data.py 生成 data.js 后刷新本页';
 
 </script>
