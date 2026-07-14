@@ -37,6 +37,7 @@ button:disabled{background:#B9C2D0;cursor:wait}
 .rows{display:flex;flex-direction:column;gap:16px;margin-top:16px}
 .card{background:var(--panel);border:1px solid var(--grid);border-left:4px solid var(--line);border-radius:6px;padding:16px 18px}
 .card.pending{border-left-color:var(--warn)}
+.tapenote{font-size:12.5px;line-height:1.85;color:#5E6D86;background:#F4F6FA;border-left:3px solid #24406B;padding:10px 14px;margin:10px 0 14px}
 .secdiv{display:flex;align-items:center;gap:16px;margin:34px 0 6px;color:#8A8272;font-size:13px;letter-spacing:.12em;font-weight:600}
 .secdiv::before,.secdiv::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,transparent,#C9BFA8,transparent)}
 .chead{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:10px}
@@ -72,6 +73,11 @@ button:disabled{background:#B9C2D0;cursor:wait}
 </header>
 
 <div class="tapehead">五渠道杠杆快照（红＝YoY上升 · 蓝＝YoY下降，韩股配色惯例）</div>
+<div class="tapenote">
+ <b>用法</b>：一眼读韩股杠杆的方向与强度——红色扩张、蓝色收缩；数值为最新交易日，标签含数据日期。<br>
+ <b>定义</b>：<b>融资余额</b>＝信用交易融资（신용거래융자）未偿本金，正式加杠杆通道；<b>股票质押</b>＝预托证券担保融资，存量持仓套现通道；<b>预托金+RP</b>＝客户在券商的现金合计（含RP理财），入市弹药总量；<b>赊欠额</b>＝委托买卖未收金（미수금），T+2结算违约挂账，超短杠杆断供量；<b>强平额</b>＝赊欠额×强平比重估算（반대매매），次日开盘被强制卖出的规模。<br>
+ <b>来源</b>：金融投资协会（日频·T+1披露）、韩国银行ECOS、金融委开放数据 · 除注明外单位为万亿韩元。
+</div>
 <div class="tape" id="tape"></div>
 
 <div class="rows" id="rows"></div>
@@ -180,24 +186,24 @@ const S=[
  {no:2,key:'time',title:'定期及储蓄性存款'},
  {no:3,key:'hh',title:'家庭信用总额（가계신용·季频）'},
  {no:4,key:'hhloan',title:'存款银行家庭贷款'},
- {no:5,key:'otherloan',title:'其他贷款（기타대출·非住房抵押）'},
- {no:6,key:'nbloan',title:'非银行存款机构家庭贷款'},
+ {no:5,key:'otherloan',title:'其他贷款（기타대출·信用贷/负存折等非房贷）'},
+ {no:6,key:'nbloan',title:'非银行存款机构家庭贷款（二金融圈）'},
  {divider:1,label:'券商数据 · 金融投资协会 · 日频'},
- {no:7,key:'yetakrp',title:'投资者预托金＋对客RP合计'},
+ {no:7,key:'yetakrp',title:'投资者预托金＋对客RP合计（券商客户现金总量）'},
  {no:8,key:'yetak',title:'投资者预托金（투자자예탁금）'},
- {no:9,key:'rp',title:'对客户RP销售余额'},
- {no:10,key:'cma',title:'CMA账户余额'},
- {no:11,key:'mmf',title:'MMF净资产'},
+ {no:9,key:'rp',title:'对客户RP销售余额（客户回购理财）'},
+ {no:10,key:'cma',title:'CMA账户余额（综合资产管理账户）'},
+ {no:11,key:'mmf',title:'MMF净资产（货币市场基金）'},
  {no:12,key:'stockfund',title:'股票型基金净资产'},
- {no:13,key:'yungja',title:'信用交易融资余额'},
- {no:14,key:'jiya',title:'预托证券担保融资余额'},
- {no:15,key:'misu',title:'委托买卖未收金余额'},
- {no:16,key:'forced',title:'未收金对强制平仓比重',type:'ratio'},
+ {no:13,key:'yungja',title:'信用交易融资余额（融资）'},
+ {no:14,key:'jiya',title:'预托证券担保融资余额（股票质押）'},
+ {no:15,key:'misu',title:'委托买卖未收金余额（赊欠额）'},
+ {no:16,key:'forced',title:'未收金对强制平仓比重（强平比重）',type:'ratio'},
  {divider:1,label:'杠杆产品 · 期货 / 杠杆ETF / 结构化 · 金融委/协会'},
  {no:17,key:'futoi',title:'股指与个股期货未平仓名义金额（KOSPI200·三星电子·SK海力士）'},
  {no:18,key:'levetf',title:'杠杆ETF总市值'},
- {no:19,key:'els',title:'ELS未偿余额（원금비보장형·月度）'},
- {no:20,key:'dls',title:'DLS未偿余额（월度）'},
+ {no:19,key:'els',title:'ELS未偿余额（股票挂钩证券·원금비보장형）'},
+ {no:20,key:'dls',title:'DLS未偿余额（衍生结合证券）'},
 ];
 const GATED=['futoi','levetf','els','dls','nbloan','mmf','stockfund','yetakrp'];
 function activeS(){return S.filter(s=>s.divider||!GATED.includes(s.key)||(SER[s.key]&&SER[s.key].d&&SER[s.key].d.length))}
@@ -289,11 +295,22 @@ function renderForced(){
     plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>` ${c.parsed.y==null?'—':c.parsed.y.toFixed(1)+'%'}`}}},
     scales:{x:{ticks:{...axFont,maxTicksLimit:10,autoSkip:true},grid:{display:false}},y:{ticks:{...axFont,maxTicksLimit:6,callback:v=>tick(v)+'%'},grid:{color:'#E9EEF5'}}}}});
 }
+function forcedAmtSeries(){
+  const m=SER.misu,f=SER.forced;
+  if(!m||!f||!m.d||!f.d)return null;
+  const fm={};f.d.forEach((dt,i)=>fm[dt]=f.v[i]);
+  const d=[],v=[];
+  m.d.forEach((dt,i)=>{if(fm[dt]!=null&&m.v[i]!=null){d.push(dt);v.push(+(m.v[i]*fm[dt]/100*1000).toFixed(1))}});
+  return d.length?{d,v}:null;   // 单位: 十亿韩元(억×10)
+}
 function buildTape(){
-  const items=[['融资','yungja'],['股票质押','jiya'],['预托金','yetak'],['CMA','cma'],['对客回购','rp'],['KOSPI市值','__m']];
+  const items=[['融资余额','yungja'],['股票质押','jiya'],['预托金+RP','yetakrp'],['赊欠额','misu'],['强平额(估算)','__f'],['KOSPI市值','__m']];
   document.getElementById('tape').innerHTML=items.map(([n,k])=>{
     if(k==='__m'){if(!MCAP)return `<div class="chip"><div class="k">KOSPI市值</div><div class="v">—</div><span class="y pn">待脚本拉取</span></div>`;
       return `<div class="chip"><div class="k">${n} · ${MCAP.date}</div><div class="v">${fmt(MCAP.val,0)}<small> 万亿</small></div><span class="y pn">日频</span></div>`}
+    if(k==='__f'){const s=forcedAmtSeries();if(!s)return '';
+      const {v,i}=last(s.v);const y=yoyLatest(s.d,s.v);
+      return `<div class="chip"><div class="k">${n} · ${s.d[i]}</div><div class="v">${fmt(v)}<small> 十亿</small></div><span class="y ${pillCls(y)}">YoY ${pct(y)}</span></div>`}
     const d=SER[k];if(!d)return '';const {v,i}=last(d.v);const y=yoyLatest(d.d,d.v);
     return `<div class="chip"><div class="k">${n} · ${d.d[i]}</div><div class="v">${fmt(v)}<small> 万亿</small></div><span class="y ${pillCls(y)}">YoY ${pct(y)}</span></div>`}).join('');
 }
