@@ -12,6 +12,7 @@
   [可选] data.go.kr    协会资金面(原始)    日频  全历史     (需在下方填入公共数据门户密钥)
          → 免费注册 data.go.kr → 搜「금융투자협회종합통계」(编号15094809) → 활용신청(自动批准)
 """
+import re
 import json, math, os, sys, time, datetime as dt
 try:
     import requests
@@ -383,11 +384,16 @@ def fetch_futoi():
             cl_field=next((k for k in rows[0] if k.lower()=="clpr"),None) or                      next((k for k in rows[0] if "clpr" in k.lower()),None)
             if not (df and nm_field and oi_field and cl_field):
                 dbg(f"futoi字段嗅探失败 df={df} nm={nm_field} oi={oi_field} cl={cl_field}"); return {}
+        nms=sorted({str(r.get(nm_field,"")) for r in rows})
+        dbg(f"futoi:{kw} 名称样本({len(nms)}种): "+", ".join(nms[:12]))
+        pcs=sorted({str(r.get("prdCtg","")) for r in rows})
+        dbg(f"futoi:{kw} prdCtg取值: {pcs[:8]}")
+        kwn=kw.replace(" ","")
         n=0
         for r in rows:
-            nm=str(r.get(nm_field,""))
-            if kw not in nm or "선물" not in nm: continue
-            if any(x in nm for x in EXCL): continue
+            nm=str(r.get(nm_field,"")); nm2=nm.replace(" ","")
+            if kwn not in nm2 or "선물" not in nm2: continue
+            if any(x in nm2 for x in EXCL): continue
             t=str(r.get(df,""))
             oi=_num(r.get(oi_field)); cl=_num(r.get(cl_field))
             if len(t)!=8 or oi is None or cl is None: continue
@@ -529,11 +535,15 @@ def fetch_dls():
         next((k for k in rows[0] if "ctg" in k.lower()),None)
     if not amt: dbg("dls未找到金额字段"); return {}
     vals=sorted({str(r.get(ctg,"")) for r in rows}) if ctg else []
-    if ctg: dbg(f"dls分类{ctg}取值: {vals[:10]}")
-    dls_val=next((v for v in vals if "DLS" in v.upper() or "파생결합증권" in v),None) if ctg else None
+    pres=sorted({str(r.get("presCtg","")) for r in rows})
+    dbg(f"dls分类{ctg}取值: {vals[:8]} | presCtg: {pres[:8]}")
+    dls_val=next((v for v in vals if "비보장" in v),None) or \
+            next((v for v in vals if "DLS" in v.upper()),None)
+    pres_val=next((p for p in pres if "발행" in p),None)
     monthly={}
     for r in rows:
-        if ctg and dls_val is not None and str(r.get(ctg,""))!=dls_val: continue
+        if dls_val is not None and str(r.get(ctg,""))!=dls_val: continue
+        if pres_val is not None and str(r.get("presCtg",""))!=pres_val: continue
         v=_num(r.get(amt))
         if v is None: continue
         kd=_ymkey(r.get("basDt"))
