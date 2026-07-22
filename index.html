@@ -94,6 +94,7 @@ button:disabled{background:#B9C2D0;cursor:wait}
   <tr><td>图表交互</td><td>所有图表支持：滚轮缩放时间轴 · 按住拖动平移 · 触屏双指缩放 · 双击图表复位</td></tr>
   <tr><td>非银行家庭贷款（06）</td><td>ECOS 151Y002 비은행예금취급기관（储蓄银行/相互金融等二金融圈）家庭贷款末残 · 月频 · 与03B对照读监管套利式加杠杆（银行降+非银升）</td></tr>
   <tr><td>MMF/股票型基金（11/12）</td><td>协会「getFundTotalNetEssetInfo」按基金类型净资产 · MMF与CMA/预托金互为资金分流；股票型基金为间接入市通道</td></tr>
+  <tr><td>CFD余额（21）</td><td>协会官网「종목별 CFD 잔고동향」日度PDF逐股票买/卖余额加总 · 仅国内股票 · 名义金额口径（保证金率≥40%）· 2023-09披露起 · T+1 · 历史滚动回填中，起点日期将逐日向2023-09延伸</td></tr>
   <tr><td>DLS未偿余额（20）</td><td>协会「getDLSAndDLBInfo」原金非保障型未偿余额 · 月度存量</td></tr>
   <tr><td>期货未平仓名义（17）</td><td>金融委「파생상품시세정보」선물시세 · 日频 · 名义规模＝未平仓合约×收盘价×乘数（KOSPI200为25万韩元/点，个股期货为10股），跨到期月加总，剔除迷你/周度/价差合约 · 2020年起</td></tr>
   <tr><td>杠杆ETF总市值（18）</td><td>金融委「증권상품시세정보」ETF시세 · 日频 · 名称含「레버리지」的全部上市ETF市值加总（本土多头杠杆系）· 2020年起</td></tr>
@@ -215,8 +216,9 @@ const S=[
  {no:18,key:'levetf',title:'杠杆ETF总市值'},
  {no:19,key:'els',title:'ELS未偿余额（股票挂钩证券·원금비보장형）'},
  {no:20,key:'dls',title:'DLS未偿余额（衍生结合证券）'},
+ {no:21,key:'cfdbuy',title:'CFD余额·国内股票·多空（差额结算交易）',type:'cfd'},
 ];
-const GATED=['futoi','levetf','els','dls','nbloan','mmf','stockfund','yetakrp'];
+const GATED=['futoi','levetf','els','dls','nbloan','mmf','stockfund','yetakrp','cfdbuy'];
 function activeS(){return S.filter(s=>s.divider||!GATED.includes(s.key)||(SER[s.key]&&SER[s.key].d&&SER[s.key].d.length))}
 const freqLabel=f=>f==='D'?'日频':f==='Q'?'季频':'月频';
 
@@ -262,6 +264,9 @@ function ratioChart(id,labels,vals){
 function buildCards(){
   document.getElementById('rows').innerHTML=activeS().map(s=>{
     if(s.divider)return `<div class="secdiv"><span>${s.label}</span></div>`;
+    if(s.type==='cfd')return `<div class="card"><div class="chead"><span class="cnum">21</span><span class="ctitle">${s.title}</span><span class="freq" id="freq-cfd"></span><div class="stats" id="stats-cfd"></div></div>
+      <div class="cgrid"><div class="chwrap"><div class="chlbl">买入余额（蓝）＋卖出余额（金）＋KOSPI（绿·对数右轴）</div><div class="chbox"><canvas id="lv-cfd"></canvas></div></div>
+      <div class="chwrap r"><div class="chlbl">占KOSPI总市值（%）·买/卖</div><div class="chbox"><canvas id="rt-cfd"></canvas></div></div></div></div>`;
     if(s.type==='ratio')return `<div class="card"><div class="chead"><span class="cnum">16</span><span class="ctitle">${s.title}</span><span class="freq" id="freq-forced"></span><div class="stats" id="stats-forced"></div></div>
       <div class="chlbl">比例时序（%）</div><div class="cv" style="height:260px"><canvas id="ch-forced"></canvas></div></div>`;
     return `<div class="card" id="card-${s.key}"><div class="chead"><span class="cnum">${String(s.no).padStart(2,'0')}</span><span class="ctitle">${s.title}</span><span class="freq" id="freq-${s.key}"></span><div class="stats" id="stats-${s.key}"></div></div>
@@ -326,7 +331,40 @@ function buildTape(){
     const d=SER[k];if(!d)return '';const {v,i}=last(d.v);const y=yoyLatest(d.d,d.v);
     return `<div class="chip"><div class="k">${n} · ${d.d[i]}</div><div class="v">${fmt(v)}<small> T</small></div><span class="y ${pillCls(y)}">YoY ${pct(y)}</span></div>`}).join('');
 }
-function renderAll(){buildTape();activeS().forEach(s=>{if(s.divider)return;s.type==='ratio'?renderForced():renderSeries(s)})}
+function renderAll(){buildTape();activeS().forEach(s=>{if(s.divider)return;if(s.type==='cfd')return renderCFD();s.type==='ratio'?renderForced():renderSeries(s)})}
+function renderCFD(){
+  const b=SER.cfdbuy,sl=SER.cfdsell;
+  if(!b||!b.d||!b.d.length)return;
+  document.getElementById('freq-cfd').textContent='日频 · 협会公告板 · 2023-09起';
+  const bl=b.v[b.v.length-1], slv=sl?sl.v[sl.v.length-1]:null;
+  const yb=yoyLatest(b.d,b.v), ys=sl?yoyLatest(sl.d,sl.v):null;
+  const ratio=(slv!=null&&bl+slv>0)?(slv/(bl+slv)*100):null;
+  document.getElementById('stats-cfd').innerHTML=
+    `<div class="stat"><div class="l">买入余额 · ${b.d[b.d.length-1]}</div><div class="n">${fmt(bl)}<small> T</small></div><span class="y ${pillCls(yb)}">YoY ${pct(yb)}</span></div>`+
+    (slv!=null?`<div class="stat"><div class="l">卖出余额</div><div class="n">${fmt(slv)}<small> T</small></div><span class="y ${pillCls(ys)}">YoY ${pct(ys)}</span></div>`:'')+
+    (ratio!=null?`<div class="stat"><div class="l">卖出占比</div><div class="n">${ratio.toFixed(1)}<small> %</small></div></div>`:'');
+  // 左图: 多空双线+KOSPI
+  const ds=[{label:'买入余额(T)',data:b.v,borderColor:'#24406B',borderWidth:1.6,pointRadius:0,spanGaps:true,yAxisID:'y'}];
+  if(sl){const sm={};sl.d.forEach((dt,i)=>sm[dt]=sl.v[i]);
+    ds.push({label:'卖出余额(T)',data:b.d.map(dt=>sm[dt]??null),borderColor:'#A8721C',borderWidth:1.6,pointRadius:0,spanGaps:true,yAxisID:'y'})}
+  const ks=b.d.map(dt=>kospiAtDate(dt));
+  if(ks.some(x=>x!=null))ds.push({label:'KOSPI指数(log)',data:ks,borderColor:'rgba(107,142,111,.85)',borderWidth:1.2,pointRadius:0,spanGaps:true,yAxisID:'y2'});
+  const sc={x:{ticks:{...axFont,maxTicksLimit:10,autoSkip:true},grid:{display:false}},
+    y:{position:'left',ticks:{...axFont,maxTicksLimit:6,callback:v=>tick(v)},grid:{color:'#E9EEF5'}}};
+  if(ks.some(x=>x!=null))sc.y2={type:'logarithmic',position:'right',ticks:{...axFont,maxTicksLimit:6,callback:v=>tick(v),color:'#6B8E6F'},grid:{display:false}};
+  mkChart('lv-cfd',{type:'line',data:{labels:b.d,datasets:ds},options:{responsive:true,maintainAspectRatio:false,animation:false,interaction:{mode:'index',intersect:false},
+    plugins:{legend:{display:true,labels:{boxWidth:16,boxHeight:2,font:{size:11},color:'#5E6D86'}},
+     tooltip:{titleFont:{family:mono},bodyFont:{family:mono}}},scales:sc}});
+  // 右图: 占市值双线
+  const rb=b.d.map((dt,i)=>{const m=mcapAt(dt);return m?+(b.v[i]/m*100).toFixed(3):null});
+  const rds=[{label:'买入/市值',data:rb,borderColor:'#A8721C',backgroundColor:'rgba(168,114,28,.08)',fill:true,borderWidth:1.4,pointRadius:0,spanGaps:true}];
+  if(sl){const sm={};sl.d.forEach((dt,i)=>sm[dt]=sl.v[i]);
+    const rs=b.d.map(dt=>{const m=mcapAt(dt),v=sm[dt];return (m&&v!=null)?+(v/m*100).toFixed(3):null});
+    rds.push({label:'卖出/市值',data:rs,borderColor:'#5E6D86',borderDash:[4,3],borderWidth:1.2,pointRadius:0,spanGaps:true,fill:false})}
+  mkChart('rt-cfd',{type:'line',data:{labels:b.d,datasets:rds},options:{responsive:true,maintainAspectRatio:false,animation:false,
+    plugins:{legend:{display:true,labels:{boxWidth:16,boxHeight:2,font:{size:11},color:'#5E6D86'}},tooltip:{titleFont:{family:mono},bodyFont:{family:mono}}},
+    scales:{x:{ticks:{...axFont,maxTicksLimit:10,autoSkip:true},grid:{display:false}},y:{ticks:{...axFont,maxTicksLimit:6,callback:v=>tick(v)+'%'},grid:{color:'#E9EEF5'}}}}});
+}
 
 initFromRaw();
 const ext=applyExternal();
