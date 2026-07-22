@@ -1,697 +1,340 @@
-# -*- coding: utf-8 -*-
-"""
-韩国股市资金面·杠杆监测台 —— 数据更新脚本
-用法:  python update_data.py        (与 韩国资金面杠杆监测台.html 放在同一文件夹)
-依赖:  pip install requests
-产出:  data.js (网页自动读取) + data_backup.json
-
-数据源与频率:
-  [必有] ECOS 802Y001  KOSPI总市值        日频  1995年起   (韩银接口, 密钥已内置)
-  [必有] ECOS 104Y015  活期/储蓄性存款     月频  1990年起
-  [必有] ECOS 901Y056  协会资金面(转发)    月频  长历史     (预托金/融资/RP/垫付/CMA)
-  [可选] data.go.kr    协会资金面(原始)    日频  全历史     (需在下方填入公共数据门户密钥)
-         → 免费注册 data.go.kr → 搜「금융투자협회종합통계」(编号15094809) → 활용신청(自动批准)
-"""
-import re
-import os
-import json, math, os, sys, time, datetime as dt
-try:
-    import requests
-except ImportError:
-    sys.exit("请先安装依赖:  pip install requests")
-
-# ============================= 密钥配置 =============================
-ECOS_KEY = os.environ.get("ECOS_KEY") or "CYKDMCR9HNSZMQ8JBR50"          # 韩国银行ECOS (已填)
-DATA_GO_KR_KEY = os.environ.get("DATA_GO_KR_KEY") or ""                         # 公共数据门户通用密钥(Encoding/Decoding均可试), 留空则协会数据用ECOS月频
-# ===================================================================
-
-DEBUG=[]   # 诊断信息, 会写入 data_backup.json 的 meta.debug 供远程排查
-def dbg(msg):
-    print("   [诊断]", msg, flush=True); DEBUG.append(str(msg)[:300])
-
-TODAY = dt.date.today()
-YM  = TODAY.strftime("%Y%m")
-YMD = TODAY.strftime("%Y%m%d")
-
-# 单位自校准锚点: 2026-06月末已知值(万亿韩元, 来自协会官网底稿)
-ANCHOR = {"yetak":121.6, "yungja":37.3, "jiya":25.5, "rp":108.8, "misu":1.3, "cma":110.5}
-
-
-# 合理区间(万亿韩元): 数量级校准的硬约束
-RANGE = {"mcap":(800,12000),"kospi":(300,20000),"demand":(200,2000),"time":(400,3000),"hhloan":(600,2500),"otherloan":(80,1200),"futoi":(10,800),"levetf":(2,200),"els":(1,150),"nbloan":(80,900),"mmf":(30,400),"stockfund":(20,500),"ovsderiv":(30,2000),"dls":(0.5,80),
-         "yetak":(5,400),"yungja":(1,120),"jiya":(1,120),"rp":(5,400),"misu":(0.05,20),"cma":(5,400)}
-def calibrate(key, raw_latest, unit_name):
-    """先按单位字段换算, 若落在合理区间直接用; 否则在10的幂里找能落区间的档位"""
-    lo,hi = RANGE.get(key,(0.01,20000))
-    base = unit_scale_by_name(unit_name)
-    if lo <= raw_latest*base <= hi: return base
-    for s in (1,0.1,0.01,1e-3,1e-4,1e-5,1e-6,1e-7,1e-8,1e-9,1e-10,1e-11,1e-12,1e-13):
-        if lo <= raw_latest*s <= hi: return s
-    return None
-
-def unit_scale_by_name(u):
-    u = u or ""
-    if "조" in u: return 1.0
-    if "천억" in u: return 0.1
-    if "십억" in u: return 1e-3
-    if "백만" in u: return 1e-6
-    if "억" in u: return 1e-4
-    if u.strip()=="원": return 1e-12
-    return 1e-3
-
-def snap_scale(raw_latest, anchor):
-    """在10的幂中选使 raw*scale ≈ anchor 的档位"""
-    if not raw_latest or raw_latest <= 0: return None
-    best, bd = None, 9e9
-    for s in (1,0.1,0.01,1e-3,1e-4,1e-5,1e-6,1e-7,1e-8,1e-9,1e-10,1e-11,1e-12,1e-13):
-        d = abs(math.log10(raw_latest*s) - math.log10(anchor))
-        if d < bd: bd, best = d, s
-    return best if bd < 0.5 else None   # 偏离超过~3倍则放弃校准
-
-# ---------------------------- ECOS ----------------------------
-E = "https://ecos.bok.or.kr/api"
-def ecos(path):
-    r = requests.get(f"{E}/{path}", timeout=60); r.raise_for_status()
-    j = r.json()
-    res = j.get("RESULT")
-    if res and res.get("CODE") not in (None,"INFO-000"):
-        if res.get("CODE")=="INFO-200":   # 区间内无数据 → 视为空
-            return {}
-        raise RuntimeError(f"ECOS: {res.get('CODE')} {res.get('MESSAGE')}")
-    return j
-
-def ecos_items(stat):
-    j = ecos(f"StatisticItemList/{ECOS_KEY}/json/kr/1/500/{stat}")
-    rows = (j.get("StatisticItemList") or {}).get("row") or []
-    if not rows:
-        dbg(f"{stat} 项目清单为空, 原始返回键={list(j.keys())} RESULT={j.get('RESULT')}")
-    return rows
-
-def ecos_series_all(stat, cyc, s, e):
-    """不指定项目 → 返回该表全部项目的行(带ITEM_NAME1字段), 绕开项目清单接口"""
-    j = ecos(f"StatisticSearch/{ECOS_KEY}/json/kr/1/100000/{stat}/{cyc}/{s}/{e}/")
-    return (j.get("StatisticSearch") or {}).get("row") or []
-
-def ecos_series(stat, cyc, item, s, e):
-    rows = ecos(f"StatisticSearch/{ECOS_KEY}/json/kr/1/100000/{stat}/{cyc}/{s}/{e}/{item}")
-    return rows.get("StatisticSearch",{}).get("row",[])
-
-def rows_to_pairs(rows):
-    out=[]
-    for r in rows:
-        t, v = r.get("TIME",""), r.get("DATA_VALUE")
-        try: v=float(v)
-        except (TypeError,ValueError): continue
-        if len(t)>=8: d=f"{t[:4]}-{t[4:6]}-{t[6:8]}"
-        elif len(t)>=6: d=f"{t[:4]}-{t[4:6]}"
-        else: continue
-        out.append((d,v))
-    return sorted(out)
-
-def fetch_mcap():
-    print("· KOSPI总市值(日频, ECOS 802Y001)…", flush=True)
-    items = ecos_items("802Y001")
-    it = next((r for r in items if "시가총액" in (r.get("ITEM_NAME") or "") and "코스닥" not in (r.get("ITEM_NAME") or "")), None)
-    if not it:
-        print("  项目清单:", [r.get("ITEM_NAME") for r in items][:30])
-        raise RuntimeError("802Y001 未找到市值项目(清单已打印)")
-    pairs = rows_to_pairs(ecos_series("802Y001","D",it["ITEM_CODE"],"19950103",YMD))
-    if not pairs:
-        pairs = rows_to_pairs(ecos_series("802Y001","D",it["ITEM_CODE"],"20200102",YMD))
-    if not pairs: raise RuntimeError(f"市值序列为空(项目:{it.get('ITEM_NAME')} 代码:{it.get('ITEM_CODE')})")
-    sc = calibrate("mcap", pairs[-1][1], it.get("UNIT_NAME"))
-    if sc is None: raise RuntimeError(f"市值数量级异常: 原始最新值={pairs[-1][1]} 单位={it.get('UNIT_NAME')}")
-    d=[p[0] for p in pairs]; v=[round(p[1]*sc,1) for p in pairs]
-    print(f"  ✓ {len(d)}个交易日 ({d[0]} ~ {d[-1]}), 最新 {v[-1]:,.0f} 万亿 (原始单位:{it.get('UNIT_NAME')})")
-    out_m = {"d":d,"v":v,"f":"D","src":f"ECOS 802Y001·{it.get('ITEM_NAME','')}"}
-    # 顺带抓KOSPI指数(同表, 用于页面对比线)
-    global KOSPI_OUT
-    KOSPI_OUT=None
-    try:
-        it2=next((r for r in items if ("코스피" in (r.get("ITEM_NAME") or "") or "KOSPI" in (r.get("ITEM_NAME") or ""))
-                  and "지수" in (r.get("ITEM_NAME") or "") and "코스닥" not in (r.get("ITEM_NAME") or "")
-                  and "200" not in (r.get("ITEM_NAME") or "")), None)
-        if it2:
-            p2=rows_to_pairs(ecos_series("802Y001","D",it2["ITEM_CODE"],"19950103",YMD))
-            sc2=calibrate("kospi",p2[-1][1],it2.get("UNIT_NAME")) if p2 else None
-            if sc2:
-                KOSPI_OUT={"d":[p[0] for p in p2],"v":[round(p[1]*sc2,2) for p in p2],"f":"D","src":f"ECOS 802Y001·{it2.get('ITEM_NAME','')}"}
-                print(f"  ✓ KOSPI指数 {len(p2)}点 最新 {KOSPI_OUT['v'][-1]:,.2f}")
-        else: dbg("802Y001未识别KOSPI指数项目")
-    except Exception as e: dbg(f"kospi {str(e)[:80]}")
-    return out_m
-
-def fetch_deposits():
-    out={}
-    items = ecos_items("104Y015")
-    for key, kw, label in (("demand","요구불","活期存款"),("time","저축성","定期/储蓄性存款")):
-        print(f"· {label}(月频, ECOS 104Y015)…", flush=True)
-        cands=[r for r in items if kw in (r.get("ITEM_NAME") or "")]
-        cands.sort(key=lambda r: len(r.get("ITEM_NAME") or ""))
-        if not cands:
-            print(f"  ✗ 未找到「{kw}」· 该表项目清单:", [r.get("ITEM_NAME") for r in items][:30]); continue
-        it=cands[0]
-        pairs=rows_to_pairs(ecos_series("104Y015","M",it["ITEM_CODE"],"199001",YM))
-        if not pairs: print(f"  ✗ {label}空序列"); continue
-        sc=calibrate(key, pairs[-1][1], it.get("UNIT_NAME"))
-        if sc is None: print(f"  ✗ {label}数量级异常 原始={pairs[-1][1]} 单位={it.get('UNIT_NAME')}"); continue
-        d=[p[0] for p in pairs]; v=[round(p[1]*sc,2) for p in pairs]
-        print(f"  ✓ {len(d)}个月 ({d[0]} ~ {d[-1]}), 最新 {v[-1]:,.1f} 万亿 · 项目:{it.get('ITEM_NAME')}")
-        out[key]={"d":d,"v":v,"f":"M","src":f"ECOS 104Y015·{it.get('ITEM_NAME','')}"}
-    return out
-
-def fetch_funds_ecos():
-    print("· 协会资金面(月频回退, ECOS 901Y056)…", flush=True)
-    kwmap={"yetak":["예탁금"],"yungja":["신용융자","신용거래융자"],"rp":["환매조건부","RP"],"misu":["미수금"],"cma":["CMA"]}
-    out={}
-    items = ecos_items("901Y056")
-    if items:
-        dbg("901Y056清单: "+", ".join((r.get("ITEM_NAME") or "?") for r in items[:25]))
-        groups = {}
-        for r in items:
-            nm = r.get("ITEM_NAME") or ""
-            try:
-                pairs = rows_to_pairs(ecos_series("901Y056","M",r["ITEM_CODE"],"197501",YM))
-            except Exception:
-                continue
-            if pairs: groups[nm] = (pairs, r.get("UNIT_NAME"))
-    else:
-        dbg("901Y056项目清单为空 → 整表兜底抓取")
-        rows = ecos_series_all("901Y056","M","197501",YM)
-        dbg(f"整表返回 {len(rows)} 行, 项目: "+", ".join(sorted({r.get('ITEM_NAME1') or '?' for r in rows})[:25]))
-        groups = {}
-        for r in rows:
-            nm = r.get("ITEM_NAME1") or "?"
-            groups.setdefault(nm, ([], r.get("UNIT_NAME")))
-        tmp = {nm:{} for nm in groups}
-        for r in rows:
-            nm = r.get("ITEM_NAME1") or "?"
-            t, v = r.get("TIME",""), r.get("DATA_VALUE")
-            try: v=float(v)
-            except (TypeError,ValueError): continue
-            if len(t)>=6: tmp[nm][f"{t[:4]}-{t[4:6]}"] = v
-        groups = {nm:(sorted(tmp[nm].items()), groups[nm][1]) for nm in groups if tmp[nm]}
-    for key,kws in kwmap.items():
-        hit = next((nm for nm in groups if any(k in nm for k in kws)), None)
-        if not hit: dbg(f"funds:{key} 关键词未匹配"); continue
-        pairs, unit = groups[hit]
-        sc = calibrate(key, pairs[-1][1], unit)
-        if sc is None: dbg(f"funds:{key} 数量级异常 原始={pairs[-1][1]} 单位={unit}"); continue
-        d=[p[0] for p in pairs]; v=[round(p[1]*sc,2) for p in pairs]
-        out[key]={"d":d,"v":v,"f":"M","src":f"ECOS 901Y056·{hit}"}
-        print(f"  ✓ {key}: {len(d)}月 ({d[0]}~{d[-1]}), 最新 {v[-1]:,.1f} 万亿 · {hit}")
-    return out
-
-
-def _grp_series(rows, key, src_label):
-    """151Y002行集 → 按ITEM_NAME2分组取最新值最大组(=总额)"""
-    groups={}
-    for r in rows:
-        nm=(r.get("ITEM_NAME2") or r.get("ITEM_NAME1") or "합계").strip()
-        t,v=r.get("TIME",""),r.get("DATA_VALUE")
-        try: v=float(v)
-        except (TypeError,ValueError): continue
-        if len(t)>=6: groups.setdefault(nm,{})[f"{t[:4]}-{t[4:6]}"]=(v,r.get("UNIT_NAME"))
-    if not groups: return None
-    best=None
-    for nm,mp in groups.items():
-        last=max(mp); lv=mp[last][0]
-        if best is None or lv>best[2]: best=(nm,mp,lv)
-    nm,mp,_=best
-    pairs=sorted((k,v[0]) for k,v in mp.items()); unit=next(iter(mp.values()))[1]
-    sc=calibrate(key,pairs[-1][1],unit)
-    if sc is None: dbg(f"{key}数量级异常 原始={pairs[-1][1]} 单位={unit}"); return None
-    d=[p[0] for p in pairs]; v=[round(p[1]*sc,1) for p in pairs]
-    print(f"  ✓ {key} {len(d)}个月 ({d[0]}~{d[-1]}), 最新 {v[-1]:,.1f} 万亿")
-    return {"d":d,"v":v,"f":"M","src":src_label}
-
-def fetch_hhloan():
-    print("· 家庭贷款(银行+非银行, ECOS 151Y002)…", flush=True)
-    rows_all = ecos_series_all("151Y002","M","200001",YM)
-    if not rows_all: dbg("151Y002整表为空"); return {}
-    n1=sorted({(r.get("ITEM_NAME1") or "") for r in rows_all})
-    dbg(f"151Y002机构维度: {n1[:12]}")
-    out={}
-    bank=[r for r in rows_all if "예금은행" in (r.get("ITEM_NAME1") or "")]
-    nb  =[r for r in rows_all if "비은행" in (r.get("ITEM_NAME1") or "")]
-    sb=_grp_series(bank,"hhloan","ECOS 151Y002·예금은행 가계대출(말잔)")
-    if sb: out["hhloan"]=sb
-    sn=_grp_series(nb,"nbloan","ECOS 151Y002·비은행예금취급기관 가계대출(말잔)")
-    if sn: out["nbloan"]=sn
-    elif not nb: dbg("151Y002未找到비은행机构行")
-    out.update(fetch_otherloan())
-    return out
-
-def fetch_otherloan():
-    print("· 其他贷款/기타대출(BOK月度, ECOS 151Y005 용도별)…", flush=True)
-    rows = ecos_series_all("151Y005","M","200001",YM)
-    if not rows: dbg("151Y005整表为空"); return {}
-    n1 = sorted({(r.get("ITEM_NAME1") or "") for r in rows})
-    n2 = sorted({(r.get("ITEM_NAME2") or "") for r in rows})
-    dbg(f"151Y005维度 ITEM1={n1[:12]} ITEM2={n2[:12]}")
-    def pick(names, kws):
-        return next((n for n in names if any(k in n for k in kws)), None)
-    # 找"其他贷款"所在维度; 机构维度若存在优先예금은행
-    tgt1_other = pick(n1, ["기타"]); tgt2_other = pick(n2, ["기타"])
-    bank1 = pick(n1, ["예금은행"]); bank2 = pick(n2, ["예금은행"])
-    tmp={}
-    for r in rows:
-        a,b = (r.get("ITEM_NAME1") or ""), (r.get("ITEM_NAME2") or "")
-        if tgt1_other and a!=tgt1_other: continue
-        if tgt2_other and b!=tgt2_other: continue
-        if not (tgt1_other or tgt2_other): continue
-        if bank1 and tgt1_other!=bank1 and pick([a],["예금은행"]) is None and bank1 in n1 and tgt2_other: 
-            if a!=bank1: continue
-        if bank2 and tgt1_other and b and bank2 in n2:
-            if b!=bank2: continue
-        t, val = r.get("TIME",""), r.get("DATA_VALUE")
-        try: val=float(val)
-        except (TypeError,ValueError): continue
-        if len(t)>=6: tmp[f"{t[:4]}-{t[4:6]}"]=val
-    if not tmp:
-        dbg("151Y005未定位到기타대출行"); return {}
-    pairs=sorted(tmp.items())
-    unit = rows[0].get("UNIT_NAME")
-    sc = calibrate("otherloan", pairs[-1][1], unit)
-    if sc is None: dbg(f"其他贷款数量级异常 原始={pairs[-1][1]} 单位={unit}"); return {}
-    d=[p[0] for p in pairs]; v=[round(p[1]*sc,1) for p in pairs]
-    print(f"  ✓ {len(d)}个月 ({d[0]}~{d[-1]}), 最新 {v[-1]:,.1f} 万亿")
-    return {"otherloan":{"d":d,"v":v,"f":"M","src":"ECOS 151Y005·기타대출"}}
-
-# ---------------------------- data.go.kr 协会日频 ----------------------------
-G = "https://apis.data.go.kr/1160100/service/GetKofiaStatisticsInfoService"
-OP_CANDS = {  # 官方Swagger确认的真实操作名
-  "fund":  ["getSecuritiesMarketTotalCapitalInfo"],   # 증시자금추이(日频): 预托金/RP/垫付欠款
-  "credit":["getGrantingOfCreditBalanceInfo"],        # 신용공여잔고추이(日频): 融资/质押
-  "cma":   ["getCMAStatus"],                          # 일자별CMA현황(日频)
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>韩国股市资金面·杠杆监测台</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hammer.js/2.0.8/hammer.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-zoom/2.0.1/chartjs-plugin-zoom.min.js"></script>
+<style>
+:root{
+  --paper:#F3F5F8; --panel:#FFFFFF; --ink:#17263F; --sub:#5E6D86;
+  --grid:#E2E8F1; --line:#24406B;
+  --up:#C93A36; --up-bg:#FBEDEC; --dn:#2E6DB4; --dn-bg:#EAF1F9;
+  --warn:#A8721C; --warn-bg:#FBF3E2;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
 }
-DERIV_BASE = "https://apis.data.go.kr/1160100/service/GetDerivativeProductInfoService"
-SECPRD_BASE = "https://apis.data.go.kr/1160100/service/GetSecuritiesProductInfoService"
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--paper);color:var(--ink);font-family:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.45}
+.wrap{max-width:1280px;margin:0 auto;padding:20px 16px 48px}
+header{display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px;border-bottom:3px solid var(--ink);padding-bottom:12px}
+h1{font-size:20px;letter-spacing:.06em;font-weight:800}
+h1 small{display:block;font-size:11px;letter-spacing:.1em;color:var(--sub);font-weight:600;margin-top:2px}
+.hright{margin-left:auto;display:flex;gap:8px;align-items:center}
+.badge{font:600 12px/1 var(--mono);background:var(--ink);color:#fff;padding:5px 8px;border-radius:3px}
+button{font:700 13px/1 inherit;padding:8px 14px;border:none;border-radius:4px;cursor:pointer;background:var(--up);color:#fff}
+button:disabled{background:#B9C2D0;cursor:wait}
+#status{font:500 12px var(--mono);color:var(--sub);width:100%;padding-top:6px;min-height:16px}
+.tapehead{font-size:12px;letter-spacing:.2em;color:var(--sub);margin:20px 0 6px;font-weight:700}
+.tape{display:grid;grid-template-columns:repeat(auto-fit,minmax(148px,1fr));gap:1px;background:var(--ink);border:1px solid var(--ink)}
+.chip{background:var(--panel);padding:10px 12px}
+.chip .k{font-size:11px;color:var(--sub)}
+.chip .v{font:700 19px/1.2 var(--mono)}
+.chip .v small{font-size:10px;color:var(--sub)}
+.chip .y{font:600 11px var(--mono);padding:1px 5px;border-radius:3px;display:inline-block;margin-top:3px}
+/* ------- 每行一组 ------- */
+.rows{display:flex;flex-direction:column;gap:16px;margin-top:16px}
+.card{background:var(--panel);border:1px solid var(--grid);border-left:4px solid var(--line);border-radius:6px;padding:16px 18px}
+.card.pending{border-left-color:var(--warn)}
+.tapenote{font-size:12.5px;line-height:1.85;color:#5E6D86;background:#F4F6FA;border-left:3px solid #24406B;padding:10px 14px;margin:10px 0 14px}
+.secdiv{display:flex;align-items:center;gap:16px;margin:34px 0 6px;color:#8A8272;font-size:13px;letter-spacing:.12em;font-weight:600}
+.secdiv::before,.secdiv::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,transparent,#C9BFA8,transparent)}
+.chead{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.cnum{font:800 12px var(--mono);color:#fff;background:var(--line);border-radius:3px;padding:3px 7px}
+.card.pending .cnum{background:var(--warn)}
+.ctitle{font-weight:800;font-size:17px}
+.freq{font:600 11px var(--mono);color:var(--sub);border:1px solid var(--grid);border-radius:10px;padding:2px 9px}
+.stats{display:flex;gap:26px;flex-wrap:wrap;margin-left:auto}
+.stat .l{font-size:10.5px;color:var(--sub)}
+.stat .n{font:700 19px/1.25 var(--mono);white-space:nowrap}
+.stat .n small{font-size:11px;color:var(--sub);font-weight:600}
+.pill{font:600 13px var(--mono);padding:1px 7px;border-radius:3px}
+.pu{color:var(--up);background:var(--up-bg)}.pd{color:var(--dn);background:var(--dn-bg)}.pn{color:var(--sub);background:var(--paper)}
+.charts{display:grid;grid-template-columns:3fr 2fr;gap:18px}
+@media(max-width:900px){.charts{grid-template-columns:1fr}.stats{margin-left:0}}
+.chlbl{font-size:11px;color:var(--sub);margin:2px 0 4px;font-weight:700}
+.cv{position:relative;height:300px}
+.cv .nodata{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:13px;color:var(--sub);background:repeating-linear-gradient(45deg,#FAFBFD,#FAFBFD 8px,#F3F5F8 8px,#F3F5F8 16px);border-radius:4px;text-align:center;padding:10px}
+.foot{margin-top:26px;border-top:2px solid var(--ink);padding-top:14px;font-size:12px;color:var(--sub)}
+.foot h3{font-size:12px;color:var(--ink);letter-spacing:.15em;margin-bottom:6px}
+.foot table{border-collapse:collapse;width:100%;margin:6px 0 12px}
+.foot td{border-bottom:1px solid var(--grid);padding:5px 8px 5px 0;vertical-align:top}
+.foot a{color:var(--dn)}
+@media (prefers-reduced-motion: reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>韩国股市资金面 · 杠杆监测台<small>十一项核心指标 · 总额 / YoY / 占KOSPI总市值 · ECOS官方接口 · 本地脚本或GitHub云端自动更新</small></h1>
+  <div class="hright"><span class="badge">单位：T＝T · B＝B韩元</span></div>
+  <div id="status">初始化…</div>
+</header>
 
-def gk(op, page=1, rows=5000, extra=None, base=None):
-    p = {"serviceKey":DATA_GO_KR_KEY,"pageNo":page,"numOfRows":rows,"resultType":"json"}
-    if extra: p.update(extra)
-    r = requests.get(f"{base or G}/{op}", params=p, timeout=90)
-    if r.status_code!=200: raise RuntimeError(f"HTTP{r.status_code} {r.text[:80]}")
-    try: j=r.json()
-    except ValueError: raise RuntimeError("非JSON:"+r.text[:100])
-    hd=j.get("response",{}).get("header",{})
-    if hd.get("resultCode") not in ("00","0"): raise RuntimeError(hd.get("resultMsg","err"))
-    body=j["response"]["body"]
-    return body.get("items",{}).get("item",[]), int(body.get("totalCount",0))
+<div class="tapenote">
+ <b>本监测台</b>：追踪韩国股市资金面与杠杆的20项官方序列，按资金旅程分三组——<b>银行体系</b>（存款与家庭信贷·钱的源头·月/季频）→ <b>券商数据</b>（客户现金·基金渠道·场内杠杆与强平·日频）→ <b>杠杆产品</b>（期货持仓·杠杆ETF·ELS/DLS结构化产品）。<br>
+ <b>读法</b>：每张卡左图＝总额＋YoY＋KOSPI指数对数对比线；右图＝占KOSPI总市值比重（剔除牛熊市值膨胀后的真实杠杆强度）；快照标签红＝YoY为正、蓝＝为负；<b>曲线颜色＝YoY动能</b>：较一个月前加速＝红、减速或转负＝蓝（拐点敏感）；图表支持滚轮缩放、拖动平移、双击复位。<br>
+ <b>来源与更新</b>：韩国银行ECOS · 金融投资协会FreeSIS（T+1披露）· 金融委公共数据门户，全部官方接口直连；GitHub Actions每交易日KST 09:30自动更新。<b>单位</b>：T＝万亿韩元（조원），B＝十亿韩元（십억원）。
+</div>
+<div class="tapehead">五渠道杠杆快照（红＝YoY上升 · 蓝＝YoY下降，韩股配色惯例）</div>
+<div class="tape" id="tape"></div>
 
-def probe(group):
-    for op in OP_CANDS[group]:
-        try:
-            items,total=gk(op,1,2)
-            if total>0:
-                dbg(f"探测成功 {group}:{op} 共{total}行 字段={list(items[0].keys()) if items else '?'}")
-                return op,total
-            dbg(f"{group}:{op} total=0")
-        except Exception as e:
-            dbg(f"{group}:{op} {str(e)[:80]}")
-    return None,0
+<div class="rows" id="rows"></div>
 
-def key_check():
-    """用官方文档公开的操作①验证 data.go.kr 钥匙+服务名是否有效"""
-    try:
-        items,total=gk("getTrustScaleInfo",1,2)
-        dbg(f"钥匙验证: getTrustScaleInfo 可用, total={total} → 钥匙/服务名OK, 若其他op失败则为操作名问题")
-        return True
-    except Exception as e:
-        dbg(f"钥匙验证失败: {str(e)[:120]} → 钥匙未生效或服务地址问题")
-        return False
+<div class="foot">
+ <h3>数据源与取数通道</h3>
+ <table>
+  <tr><td style="width:210px">更新方式</td><td>本页为纯查看器。与 <b>update_data.py</b> 放同一文件夹 → 运行 <code>python update_data.py</code>（依赖 requests）→ 刷新本页即加载 data.js。脚本经韩银ECOS与公共数据门户官方接口取数；填入公共数据门户密钥后，协会五序列升级为<b>日频全历史</b>。Claude预览环境因平台安全策略无法出网，仅显示内置底稿。<b>对外共享方案</b>：按交付说明把 index.html + update_data.py + workflow 放入GitHub仓库并开启Pages，Actions每个交易日自动更新 data.js——任何人打开网址即见最新数据。</td></tr>
+  <tr><td>活期 / 定期·储蓄性存款</td><td>ECOS 104Y015「存款银行韩元存款（按种类·月末余额）」· 月频 · 1990年起</td></tr>
+  <tr><td>KOSPI总市值</td><td>ECOS 802Y001（日频，近两年逐日）＋ 901Y014（月频，全历史）拼接 · 交易所源 · 比率按当月最后交易日对齐</td></tr>
+  <tr><td>预托金/融资/回购/垫付欠款/CMA</td><td>内置协会官网底稿（2000-01～2026-06）＋ ECOS 901Y056「股市周边资金动向」增量自动补新</td></tr>
+  <tr><td>预托金＋RP（07）</td><td>04与06按交易日对齐加总 · 客户在券商处的现金总弹药（未上保险栓+已上保险栓）· 消除两者互相搬家造成的单线噪音</td></tr>
+  <tr><td>KOSPI指数对比线</td><td>ECOS 802Y001 코스피지수 · 日频 · 各总额图右二轴（灰绿·对数刻度），仅作走势对比</td></tr>
+  <tr><td>图表交互</td><td>所有图表支持：滚轮缩放时间轴 · 按住拖动平移 · 触屏双指缩放 · 双击图表复位</td></tr>
+  <tr><td>非银行家庭贷款（06）</td><td>ECOS 151Y002 비은행예금취급기관（储蓄银行/相互金融等二金融圈）家庭贷款末残 · 月频 · 与03B对照读监管套利式加杠杆（银行降+非银升）</td></tr>
+  <tr><td>MMF/股票型基金（11/12）</td><td>协会「getFundTotalNetEssetInfo」按基金类型净资产 · MMF与CMA/预托金互为资金分流；股票型基金为间接入市通道</td></tr>
+  <tr><td>DLS未偿余额（20）</td><td>协会「getDLSAndDLBInfo」原金非保障型未偿余额 · 月度存量</td></tr>
+  <tr><td>期货未平仓名义（17）</td><td>金融委「파생상품시세정보」선물시세 · 日频 · 名义规模＝未平仓合约×收盘价×乘数（KOSPI200为25万韩元/点，个股期货为10股），跨到期月加总，剔除迷你/周度/价差合约 · 2020年起</td></tr>
+  <tr><td>杠杆ETF总市值（18）</td><td>金融委「증권상품시세정보」ETF시세 · 日频 · 名称含「레버리지」的全部上市ETF市值加总（本土多头杠杆系）· 2020年起</td></tr>
+  <tr><td>ELS发行金额（19）</td><td>协会「getELSAndELBInfo」 · 按月加总的发行金额（流量口径，非存量余额；存量在预托决算院SEIBro，二期接入）</td></tr>
+  <tr><td>其他贷款（BOK月度）</td><td>ECOS 151Y005「存款受理机构家庭贷款（按用途·月末余额）」其他贷款项＝非抵押部分（信用贷/负存折等빚투主通道）· 月频 · 与03B之差即住房抵押贷款</td></tr>
+  <tr><td>家庭贷款（BOK月度）</td><td>ECOS 104Y016「存款银行贷款（月末余额）」家庭贷款项 · 月频 · 与季度家庭信用互为月度先行/季度定盘关系</td></tr>
+  <tr><td>股票质押 / 强平比例 / 家庭信用</td><td>内置底稿（协会FreeSIS与韩银无对应开放接口项 / 季频），更新需官网下载</td></tr>
+ </table>
+ <h3>方法说明</h3>
+ <p>① 各序列取官方最高频率：市值日频、存款与协会资金面月频（协会日频仅官网提供）、家庭信用季频。② YoY＝对12个月（家庭信用4个季度）前。③ 占市值＝指标÷当月最后交易日KOSPI总市值。④ 单位按接口返回单位字段自动换算为T。⑤ AI代理转录的数据建议抽查1-2个点与ECOS页面核对。⑥ 接口密钥明文内嵌，请勿公开分发。⑦ 原需求第2、9条比率分母笔误已按各指标自身÷市值更正。</p>
+</div>
+</div>
 
-def date_field(item):
-    for k,v in item.items():
-        s=str(v)
-        if len(s)==8 and s.isdigit() and s.startswith(("19","20")): return k
-    return None
+<script src="data.js"></script>
+<script>
+/* ================= 内置底稿(协会官网, 2000-01~2026-06) ================= */
+const RAW = {"dates": ["2000-01", "2000-02", "2000-03", "2000-04", "2000-05", "2000-06", "2000-07", "2000-08", "2000-09", "2000-10", "2000-11", "2000-12", "2001-01", "2001-02", "2001-03", "2001-04", "2001-05", "2001-06", "2001-07", "2001-08", "2001-09", "2001-10", "2001-11", "2001-12", "2002-01", "2002-02", "2002-03", "2002-04", "2002-05", "2002-06", "2002-07", "2002-08", "2002-09", "2002-10", "2002-11", "2002-12", "2003-01", "2003-02", "2003-03", "2003-04", "2003-05", "2003-06", "2003-07", "2003-08", "2003-09", "2003-10", "2003-11", "2003-12", "2004-01", "2004-02", "2004-03", "2004-04", "2004-05", "2004-06", "2004-07", "2004-08", "2004-09", "2004-10", "2004-11", "2004-12", "2005-01", "2005-02", "2005-03", "2005-04", "2005-05", "2005-06", "2005-07", "2005-08", "2005-09", "2005-10", "2005-11", "2005-12", "2006-01", "2006-02", "2006-03", "2006-04", "2006-05", "2006-06", "2006-07", "2006-08", "2006-09", "2006-10", "2006-11", "2006-12", "2007-01", "2007-02", "2007-03", "2007-04", "2007-05", "2007-06", "2007-07", "2007-08", "2007-09", "2007-10", "2007-11", "2007-12", "2008-01", "2008-02", "2008-03", "2008-04", "2008-05", "2008-06", "2008-07", "2008-08", "2008-09", "2008-10", "2008-11", "2008-12", "2009-01", "2009-02", "2009-03", "2009-04", "2009-05", "2009-06", "2009-07", "2009-08", "2009-09", "2009-10", "2009-11", "2009-12", "2010-01", "2010-02", "2010-03", "2010-04", "2010-05", "2010-06", "2010-07", "2010-08", "2010-09", "2010-10", "2010-11", "2010-12", "2011-01", "2011-02", "2011-03", "2011-04", "2011-05", "2011-06", "2011-07", "2011-08", "2011-09", "2011-10", "2011-11", "2011-12", "2012-01", "2012-02", "2012-03", "2012-04", "2012-05", "2012-06", "2012-07", "2012-08", "2012-09", "2012-10", "2012-11", "2012-12", "2013-01", "2013-02", "2013-03", "2013-04", "2013-05", "2013-06", "2013-07", "2013-08", "2013-09", "2013-10", "2013-11", "2013-12", "2014-01", "2014-02", "2014-03", "2014-04", "2014-05", "2014-06", "2014-07", "2014-08", "2014-09", "2014-10", "2014-11", "2014-12", "2015-01", "2015-02", "2015-03", "2015-04", "2015-05", "2015-06", "2015-07", "2015-08", "2015-09", "2015-10", "2015-11", "2015-12", "2016-01", "2016-02", "2016-03", "2016-04", "2016-05", "2016-06", "2016-07", "2016-08", "2016-09", "2016-10", "2016-11", "2016-12", "2017-01", "2017-02", "2017-03", "2017-04", "2017-05", "2017-06", "2017-07", "2017-08", "2017-09", "2017-10", "2017-11", "2017-12", "2018-01", "2018-02", "2018-03", "2018-04", "2018-05", "2018-06", "2018-07", "2018-08", "2018-09", "2018-10", "2018-11", "2018-12", "2019-01", "2019-02", "2019-03", "2019-04", "2019-05", "2019-06", "2019-07", "2019-08", "2019-09", "2019-10", "2019-11", "2019-12", "2020-01", "2020-02", "2020-03", "2020-04", "2020-05", "2020-06", "2020-07", "2020-08", "2020-09", "2020-10", "2020-11", "2020-12", "2021-01", "2021-02", "2021-03", "2021-04", "2021-05", "2021-06", "2021-07", "2021-08", "2021-09", "2021-10", "2021-11", "2021-12", "2022-01", "2022-02", "2022-03", "2022-04", "2022-05", "2022-06", "2022-07", "2022-08", "2022-09", "2022-10", "2022-11", "2022-12", "2023-01", "2023-02", "2023-03", "2023-04", "2023-05", "2023-06", "2023-07", "2023-08", "2023-09", "2023-10", "2023-11", "2023-12", "2024-01", "2024-02", "2024-03", "2024-04", "2024-05", "2024-06", "2024-07", "2024-08", "2024-09", "2024-10", "2024-11", "2024-12", "2025-01", "2025-02", "2025-03", "2025-04", "2025-05", "2025-06", "2025-07", "2025-08", "2025-09", "2025-10", "2025-11", "2025-12", "2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06"], "yetak": [9.4, 10.6, 10.8, 10.1, 9.7, 9.6, 9.2, 8.5, 7.5, 7.0, 7.1, 6.1, 8.7, 8.2, 7.6, 8.7, 9.0, 7.8, 7.6, 7.6, 8.2, 8.2, 9.9, 9.6, 11.6, 10.8, 12.0, 11.7, 10.2, 9.6, 9.3, 9.3, 8.2, 9.1, 9.2, 8.1, 7.8, 8.0, 11.0, 10.0, 9.8, 10.4, 10.2, 10.0, 9.1, 9.8, 9.5, 9.5, 9.5, 9.0, 8.9, 10.4, 8.7, 8.4, 7.8, 8.5, 8.8, 8.1, 8.6, 8.1, 10.0, 10.6, 10.0, 9.4, 9.7, 10.1, 11.6, 11.1, 11.8, 11.5, 12.8, 11.9, 13.1, 12.1, 11.2, 13.3, 10.8, 9.8, 9.7, 9.6, 9.3, 9.6, 9.3, 8.4, 8.5, 9.7, 9.9, 11.4, 13.2, 14.0, 14.6, 12.8, 12.7, 13.1, 10.8, 9.5, 9.8, 9.3, 9.6, 11.0, 10.0, 9.2, 9.0, 8.1, 9.4, 10.0, 9.6, 9.2, 10.0, 10.3, 12.9, 14.3, 14.6, 12.7, 14.4, 13.9, 13.9, 13.1, 12.3, 11.8, 13.1, 12.2, 13.1, 14.0, 13.6, 13.7, 13.6, 12.7, 13.8, 14.8, 15.1, 13.7, 16.3, 14.7, 15.6, 17.3, 15.2, 15.6, 17.3, 19.3, 18.7, 20.5, 18.3, 17.4, 20.1, 19.9, 18.2, 17.8, 16.9, 16.4, 16.3, 18.3, 18.7, 16.9, 16.7, 17.1, 16.7, 17.2, 17.2, 18.0, 18.5, 18.3, 17.4, 17.5, 16.3, 15.3, 14.6, 13.9, 14.1, 13.9, 13.6, 14.9, 14.8, 14.3, 15.6, 15.0, 15.6, 15.7, 16.0, 16.1, 16.4, 16.7, 18.4, 21.2, 21.0, 21.7, 20.8, 20.9, 22.0, 21.1, 20.8, 20.9, 20.4, 20.7, 21.4, 22.9, 21.5, 23.9, 22.7, 21.7, 21.9, 22.0, 21.6, 21.8, 21.9, 22.2, 21.8, 24.9, 24.0, 23.9, 24.3, 23.3, 23.1, 24.3, 26.1, 26.5, 30.7, 26.9, 27.0, 28.3, 28.8, 26.9, 27.7, 25.7, 27.0, 25.3, 22.7, 24.8, 28.2, 25.5, 25.0, 25.8, 24.3, 24.7, 24.1, 23.2, 24.5, 25.0, 24.7, 27.4, 28.7, 31.2, 43.1, 42.8, 44.0, 46.3, 47.8, 60.5, 53.9, 55.0, 61.6, 65.5, 68.0, 63.9, 62.6, 58.4, 64.1, 66.1, 67.3, 69.6, 68.3, 66.7, 66.0, 67.5, 70.3, 63.4, 63.3, 61.4, 57.6, 57.4, 54.3, 53.1, 50.9, 48.6, 46.7, 46.4, 49.3, 47.7, 50.6, 53.1, 52.0, 51.8, 56.0, 51.6, 50.0, 46.1, 48.5, 52.8, 50.7, 54.3, 56.5, 57.2, 54.4, 56.5, 54.3, 52.1, 56.8, 50.6, 52.3, 54.2, 55.6, 56.1, 58.5, 57.5, 57.3, 69.0, 68.7, 66.3, 76.4, 85.5, 77.9, 87.8, 106.0, 118.7, 110.3, 124.8, 131.6, 121.6], "cma": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, 2.8, 3.0, 4.4, null, 6.7, 7.8, 8.7, 10.0, 11.3, null, 16.3, 17.4, null, 21.2, 23.0, 24.6, null, 26.4, 27.2, 26.3, 27.4, 28.0, 29.7, 30.9, 31.0, 31.9, 32.3, 32.0, 28.6, 29.4, 30.7, 34.1, 35.2, 36.6, 37.8, 38.4, 38.3, 40.1, 39.8, 38.9, 39.1, 37.8, 38.2, 37.0, 37.9, 38.8, 41.3, 40.0, 41.3, 42.9, 42.2, 41.9, 41.3, 42.5, 44.0, 44.1, 43.5, 43.6, 44.9, 42.1, 41.4, 39.5, 39.8, 39.0, 38.6, 38.3, 38.6, 41.7, 40.3, 41.3, 40.2, 38.5, 37.7, 38.8, 41.5, 40.4, 39.8, 40.2, 40.5, 41.6, 41.5, 42.4, 42.5, 42.7, 40.9, 41.4, 41.4, 41.6, 41.9, 41.7, 41.8, 42.0, 42.8, 42.1, 41.8, 43.8, 43.1, 41.7, 44.3, 44.4, 43.8, 45.7, 46.3, 46.9, 47.6, 47.5, 49.5, 50.3, 49.2, 48.3, 49.8, 50.2, 46.8, 51.0, 52.3, 51.0, 51.5, 49.6, 51.1, 52.0, 51.7, 52.2, 52.1, 51.6, 52.0, 50.5, 53.7, 54.2, 52.8, 54.4, 53.2, 52.1, 53.8, 53.6, 54.1, 53.7, 52.9, 50.5, 55.3, 51.8, 53.3, 53.1, 52.6, 51.6, 49.2, 50.5, 50.2, 50.0, 46.9, 48.3, 48.9, 48.8, 49.6, 49.6, 50.9, 49.3, 49.3, 48.4, 49.2, 49.5, 46.6, 50.0, 51.9, 51.8, 51.4, 52.8, 54.4, 55.2, 58.2, 56.1, 61.0, 64.9, 61.3, 59.7, 65.6, 62.6, 64.8, 67.9, 45.4, 69.2, 70.1, 57.8, 67.8, 67.5, 67.2, 65.1, 68.6, 69.1, 69.5, 67.7, 69.4, 68.1, 65.8, 64.6, 64.4, 63.2, 61.2, 60.4, 57.5, 58.3, 59.6, 62.7, 69.7, 68.1, 68.5, 68.5, 69.4, 70.6, 69.8, 70.9, 73.9, 75.3, 78.9, 80.5, 81.4, 83.2, 84.2, 85.6, 88.0, 86.2, 85.7, 86.4, 86.8, 88.0, 87.5, 87.3, 87.8, 86.0, 88.7, 90.8, 92.5, 93.5, 96.3, 98.1, 100.3, 103.3, 108.7, 109.7, 115.9, 113.6, 110.5], "rp": [1.3, 1.2, 1.6, 1.3, 1.4, 1.4, 1.4, 1.6, 1.3, 1.3, 1.8, 2.4, 2.8, 2.9, 3.4, 3.6, 3.6, 3.3, 3.0, 2.9, 2.9, 2.6, 2.9, 2.9, 3.0, 3.0, 2.7, 3.0, 3.6, 3.6, 3.7, 3.7, 3.3, 3.7, 3.8, 3.1, 3.6, 3.6, 3.8, 4.2, 4.2, 4.2, 4.2, 4.7, 4.8, 4.5, 5.1, 5.0, 5.1, 5.7, 5.1, 5.6, 6.0, 6.1, 6.1, 5.9, 5.6, 5.2, 5.2, 5.1, 5.3, 5.5, 4.9, 5.5, 6.1, 6.1, 6.1, 6.9, 7.0, 7.4, 9.4, 7.9, 8.6, 8.7, 8.6, 8.9, 8.9, 11.9, 14.8, 16.0, 17.2, 18.7, 19.2, 19.4, 19.8, 19.7, 20.9, 22.5, 22.8, 25.4, 26.5, 28.1, 30.5, 31.5, 31.9, 32.3, 32.0, 34.0, 32.9, 35.4, 36.5, 38.0, 37.4, 38.8, 37.9, 34.5, 36.6, 38.4, 40.9, 41.1, 42.8, 44.9, 46.8, 46.8, 48.7, 48.6, 49.0, 47.8, 46.9, 46.6, 46.3, 47.3, 49.8, 52.7, 52.5, 53.4, 53.3, 52.7, 53.3, 53.2, 54.8, 55.1, 56.5, 54.2, 54.6, 57.6, 57.2, 53.4, 55.0, 57.2, 56.2, 60.1, 62.4, 58.9, 64.1, 60.2, 59.8, 60.7, 60.1, 61.9, 62.2, 64.6, 63.1, 63.3, 64.2, 62.3, 66.2, 69.1, 70.0, 70.5, 71.1, 71.4, 72.1, 72.7, 72.1, 73.1, 71.8, 69.6, 71.0, 71.9, 70.2, 70.3, 72.0, 70.5, 71.0, 73.6, 73.2, 72.4, 74.2, 70.0, 72.6, 72.5, 73.2, 74.8, 75.4, 73.7, 72.2, 72.6, 72.2, 70.7, 73.0, 71.6, 72.7, 73.1, 71.7, 73.9, 74.2, 74.1, 74.7, 73.6, 73.1, 73.7, 72.7, 71.3, 71.3, 70.6, 70.5, 71.0, 70.6, 70.7, 70.2, 71.1, 70.2, 69.9, 68.6, 65.4, 67.7, 67.6, 66.3, 67.6, 67.5, 65.3, 66.6, 66.7, 63.3, 63.5, 63.9, 57.8, 63.8, 64.9, 61.7, 66.4, 66.8, 61.6, 67.1, 68.1, 62.4, 69.4, 68.2, 62.5, 67.9, 73.5, 71.2, 77.0, 78.5, 76.8, 81.3, 85.4, 82.9, 87.9, 89.2, 84.2, 90.1, 92.3, 89.2, 82.1, 95.1, 89.6, 88.0, 92.1, 87.5, 92.4, 90.7, 83.4, 89.6, 90.0, 83.1, 88.7, 86.9, 77.6, 80.7, 79.4, 73.3, 72.7, 70.5, 59.1, 68.9, 70.8, 68.4, 76.6, 76.2, 71.1, 76.4, 77.3, 72.4, 77.0, 78.1, 71.6, 80.4, 83.6, 81.2, 85.4, 87.6, 84.7, 91.1, 91.0, 86.5, 90.9, 92.6, 83.4, 92.3, 93.1, 91.0, 94.1, 95.2, 93.2, 98.0, 100.0, 98.8, 102.5, 103.9, 100.3, 105.0, 111.0, 109.7, 115.3, 114.7, 108.8], "yungja": [0.6, 0.5, 0.4, 0.3, 0.3, 0.3, 0.3, 0.2, 0.2, 0.2, 0.2, 0.1, 0.1, 0.2, 0.2, 0.1, 0.2, 0.2, 0.2, 0.2, 0.1, 0.1, 0.2, 0.2, 0.3, 0.3, 0.3, 0.4, 0.4, 0.3, 0.3, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.1, 0.1, 0.1, 0.2, 0.2, 0.2, 0.2, 0.2, 0.3, 0.3, 0.2, 0.2, 0.3, 0.3, 0.4, 0.4, 0.4, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.4, 0.4, 0.4, 0.4, 0.4, 0.5, 0.5, 0.5, 0.8, 1.3, 2.7, 4.9, 6.6, 5.6, 4.4, 4.3, 4.7, 4.4, 4.5, 3.6, 3.5, 3.5, 3.8, 4.1, 4.0, 3.2, 2.7, 2.3, 1.1, 1.2, 1.5, 1.6, 1.9, 2.2, 3.4, 3.9, 4.0, 3.9, 4.5, 4.9, 4.6, 4.3, 4.4, 4.8, 4.4, 4.5, 4.8, 4.7, 4.9, 5.0, 5.0, 5.2, 5.7, 5.7, 6.0, 6.4, 6.2, 6.1, 6.9, 6.5, 6.1, 6.3, 4.9, 4.2, 4.4, 4.6, 4.4, 4.5, 5.1, 5.2, 4.7, 4.2, 4.1, 3.9, 3.8, 4.3, 4.4, 4.3, 3.9, 4.2, 4.1, 4.5, 4.6, 5.0, 4.7, 4.6, 4.4, 4.4, 4.6, 4.4, 4.2, 4.4, 4.4, 4.7, 4.9, 4.9, 4.8, 5.1, 5.2, 5.4, 5.2, 5.2, 5.1, 5.5, 5.8, 6.5, 7.5, 7.7, 7.6, 7.8, 6.4, 6.6, 6.8, 6.8, 6.5, 6.7, 6.4, 6.8, 7.2, 7.1, 6.8, 7.5, 7.7, 7.7, 7.4, 6.8, 6.8, 7.1, 7.1, 7.2, 7.3, 7.8, 8.5, 8.6, 8.3, 8.3, 8.8, 10.0, 9.9, 11.3, 11.2, 11.3, 12.2, 12.5, 11.8, 10.9, 11.3, 11.8, 9.4, 9.6, 9.4, 9.9, 10.5, 10.4, 10.7, 10.3, 10.5, 9.5, 8.4, 8.8, 9.0, 9.4, 9.2, 10.1, 10.4, 6.6, 9.0, 10.9, 12.7, 14.3, 16.2, 16.4, 16.4, 17.9, 19.2, 21.0, 21.2, 22.2, 23.4, 23.2, 23.8, 24.5, 24.9, 24.8, 24.0, 23.5, 23.1, 21.7, 20.9, 22.0, 22.3, 21.6, 17.9, 18.6, 19.3, 17.2, 16.1, 17.1, 16.5, 16.1, 17.8, 18.7, 19.5, 18.6, 19.4, 19.7, 20.2, 19.7, 17.0, 17.2, 17.6, 17.8, 18.5, 19.5, 19.2, 19.8, 20.1, 19.4, 17.9, 17.5, 17.9, 16.6, 15.8, 16.8, 18.2, 17.6, 17.6, 18.3, 20.8, 21.8, 22.2, 23.5, 25.5, 26.4, 27.3, 30.3, 32.7, 32.9, 35.7, 38.0, 37.3], "jiya": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, 4.4, 4.9, 4.7, 4.8, 5.0, 5.1, 5.0, 5.1, 5.1, 5.2, 5.2, 5.3, 5.4, 5.2, 5.2, 4.9, 3.6, 3.4, 3.3, 3.2, 3.2, 3.2, 3.5, 3.8, 3.9, 3.9, 4.3, 4.4, 4.5, 4.6, 4.7, 4.9, 4.9, 4.9, 5.0, 5.3, 5.4, 5.3, 5.4, 5.6, 5.9, 6.1, 6.3, 6.5, 6.8, 6.7, 6.9, 7.1, 7.2, 7.3, 7.0, 6.7, 6.6, 6.8, 6.9, 6.6, 7.0, 6.9, 7.2, 7.2, 7.3, 7.3, 7.2, 7.3, 7.2, 7.2, 7.1, 7.2, 7.2, 7.4, 7.3, 7.4, 7.4, 7.5, 7.5, 7.6, 7.7, 7.8, 7.8, 8.0, 8.2, 8.4, 8.6, 8.6, 8.8, 8.9, 8.8, 9.1, 9.0, 9.1, 9.3, 9.4, 9.7, 10.1, 10.4, 10.6, 11.0, 11.3, 10.5, 10.6, 11.3, 11.0, 11.0, 11.2, 11.2, 11.7, 12.0, 12.1, 12.2, 12.4, 12.7, 12.9, 12.9, 12.9, 12.8, 13.1, 13.3, 13.7, 14.1, 14.7, 15.3, 15.6, 15.7, 15.9, 16.3, 17.2, 16.7, 18.0, 18.2, 18.2, 18.6, 18.7, 18.7, 18.5, 18.8, 18.9, 18.2, 18.0, 17.9, 18.1, 18.4, 18.5, 18.7, 18.8, 19.0, 18.8, 17.5, 17.4, 17.7, 17.6, 17.3, 17.7, 18.1, 15.4, 15.5, 16.1, 17.2, 17.7, 17.8, 17.3, 17.3, 18.6, 16.5, 18.4, 17.7, 18.1, 20.4, 18.4, 18.7, 18.8, 19.1, 19.5, 19.3, 19.8, 18.2, 19.4, 19.7, 20.2, 20.1, 19.9, 19.4, 19.6, 20.1, 20.0, 19.5, 19.6, 18.9, 18.9, 19.6, 20.0, 21.9, 21.7, 22.0, 22.6, 22.3, 22.3, 21.2, 21.1, 21.1, 20.2, 20.4, 20.5, 20.0, 20.1, 20.3, 20.1, 20.0, 19.7, 20.0, 19.7, 19.5, 19.7, 20.2, 20.1, 22.3, 22.4, 23.6, 23.6, 23.4, 24.6, 25.8, 24.1, 24.1, 26.1, 26.3, 25.7, 25.3, 26.3, 25.5], "misu": [0.5, 0.7, 0.8, 0.5, 0.5, 0.6, 0.5, 0.4, 0.4, 0.4, 0.4, 0.2, 0.7, 0.6, 0.4, 0.5, 0.5, 0.4, 0.3, 0.4, 0.3, 0.4, 0.8, 0.5, 0.8, 0.7, 1.2, 1.0, 0.9, 0.7, 0.7, 0.6, 0.6, 0.7, 0.8, 0.6, 0.5, 0.5, 0.5, 0.6, 0.8, 0.7, 0.7, 0.7, 0.7, 0.6, 0.6, 0.5, 0.6, 0.6, 0.5, 0.8, 0.5, 0.4, 0.4, 0.4, 0.5, 0.5, 0.5, 0.5, 0.9, 1.1, 0.8, 0.7, 0.7, 1.1, 1.4, 1.2, 1.4, 1.6, 2.1, 2.0, 1.6, 1.7, 1.2, 1.4, 0.8, 0.6, 0.6, 0.7, 0.8, 0.9, 1.0, 0.9, 0.7, 0.8, 0.8, 0.6, 0.1, 0.2, 0.4, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.1, 0.2, 0.1, 0.2, 0.2, 0.1, 0.1, 0.1, 0.2, 0.2, 0.3, 0.3, 0.1, 0.2, 0.2, 0.3, 0.2, 0.1, 0.2, 0.2, 0.2, 0.1, 0.2, 0.2, 0.1, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.3, 0.2, 0.2, 0.2, 0.1, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.5, 0.1, 0.1, 0.1, 0.1, 0.2, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.2, 0.2, 0.2, 0.2, 0.1, 0.1, 0.1, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.2, 0.1, 0.2, 0.2, 0.1, 0.2, 0.1, 0.2, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.2, 0.2, 0.1, 0.1, 0.1, 0.2, 0.2, 0.1, 0.1, 0.2, 0.2, 0.2, 0.2, 0.1, 0.1, 0.1, 0.2, 0.1, 0.2, 0.1, 0.1, 0.2, 0.2, 0.1, 0.2, 0.2, 0.1, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.3, 0.3, 0.3, 0.3, 0.3, 0.2, 0.4, 0.5, 0.4, 0.5, 0.3, 0.4, 0.3, 0.3, 0.3, 0.3, 0.4, 0.2, 0.3, 0.3, 0.3, 0.2, 0.2, 0.3, 0.2, 0.2, 0.2, 0.2, 0.3, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.3, 0.5, 0.5, 0.7, 0.5, 0.6, 1.0, 0.9, 1.0, 1.0, 1.0, 1.0, 0.9, 1.0, 1.0, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 1.0, 0.9, 0.9, 1.1, 1.0, 0.9, 1.0, 1.0, 1.1, 1.0, 1.1, 1.3, 1.3], "forced": [null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, 3.8, 1.6, 1.7, 2.3, 2.5, 2.6, 2.4, 2.1, 1.7, 1.6, 2.5, 2.3, 5.4, 1.0, 12.3, 13.8, 3.5, 7.0, 7.4, 8.1, null, 10.3, 6.4, 7.0, 8.9, 6.2, 7.8, 9.9, 7.3, 10.3, 8.6, 5.1, null, 6.6, 10.5, 6.8, 8.5, 5.7, 4.3, 5.0, 4.3, 3.8, 4.8, 2.5, null, 5.3, 2.3, 2.6, 5.4, 1.6, 3.6, 5.6, 3.7, 4.6, 3.5, 5.2, 3.7, 2.7, 4.1, 3.8, 6.4, 1.8, 3.7, 5.1, 1.6, 5.8, 1.9, 2.6, null, 6.6, 3.0, 5.7, 4.9, 0.8, 5.6, 2.5, 9.3, 6.1, 6.2, 3.6, 1.7, 3.1, 3.3, 3.9, 4.6, 5.3, 4.2, 3.1, 4.7, 3.4, 2.8, 2.5, 2.4, 5.2, 2.4, 5.0, 6.3, 3.6, 4.6, 9.6, 2.7, 3.8, 4.1, 4.1, 0.1, 4.4, 4.0, 3.6, 4.8, 7.2, 1.7, 6.0, 2.5, 3.8, 3.5, 3.2, 1.8, 3.5, 2.3, 2.6, 4.0, 2.4, 4.1, 3.6, 3.6, 3.6, 4.2, 2.6, 2.3, 2.7, 3.3, 3.9, 2.7, 2.6, 4.3, 3.5, 2.8, 3.5, 5.9, 5.4, 1.1, 1.8, 4.0, 5.4, 4.3, 5.8, 3.1, 2.6, 4.3, 3.8, 7.0, 2.7, 7.1, 3.9, 8.4, 5.6, 3.8, 5.0, 6.4, 7.1, 4.0, 10.1, 4.5, 5.5, 4.3, 6.6, 4.8, 5.7, 6.3, 6.8, 6.9, 5.4, 6.5, 6.7, 4.7, 8.6, 3.1, 5.9, 7.5, 3.4, 7.8, 3.7, 8.0, 6.8, 4.9, 11.9, 3.4, 8.5, 2.4, 6.8, 4.1, 6.3, 8.1, 4.5, 8.1, 6.0, 7.8, 15.8, 3.9, 6.1, 5.5, 6.4, 6.8, 18.8, 21.0, 13.9, 10.1, 15.4, 6.6, 11.1, 1.5, 0.6, null, 0.5, 0.8, 0.7, 0.5, 1.0, 0.6, 0.4, 0.5, 0.8, 0.5, 0.5, null, 0.4, 0.9, 1.3, 0.6, 0.4, 1.4, 0.5, 0.8, 1.6, 0.7, 0.4, 0.3, 1.0, 0.8, 3.5, 1.4, 1.4, 5.1], "hh": {"dates": ["2002-12", "2003-03", "2003-06", "2003-09", "2003-12", "2004-03", "2004-06", "2004-09", "2004-12", "2005-03", "2005-06", "2005-09", "2005-12", "2006-03", "2006-06", "2006-09", "2006-12", "2007-03", "2007-06", "2007-09", "2007-12", "2008-03", "2008-06", "2008-09", "2008-12", "2009-03", "2009-06", "2009-09", "2009-12", "2010-03", "2010-06", "2010-09", "2010-12", "2011-03", "2011-06", "2011-09", "2011-12", "2012-03", "2012-06", "2012-09", "2012-12", "2013-03", "2013-06", "2013-09", "2013-12", "2014-03", "2014-06", "2014-09", "2014-12", "2015-03", "2015-06", "2015-09", "2015-12", "2016-03", "2016-06", "2016-09", "2016-12", "2017-03", "2017-06", "2017-09", "2017-12", "2018-03", "2018-06", "2018-09", "2018-12", "2019-03", "2019-06", "2019-09", "2019-12", "2020-03", "2020-06", "2020-09", "2020-12", "2021-03", "2021-06", "2021-09", "2021-12", "2022-03", "2022-06", "2022-09", "2022-12", "2023-03", "2023-06", "2023-09", "2023-12", "2024-03", "2024-06", "2024-09", "2024-12", "2025-03", "2025-06", "2025-09", "2025-12", "2026-03"], "vals": [464.7, 463.3, 464.6, 463.5, 472.1, 472.3, 477.3, 482.5, 494.2, 497.0, 516.0, 527.1, 542.9, 550.3, 569.4, 582.5, 607.1, 612.4, 629.6, 642.0, 665.4, 677.2, 698.2, 713.3, 723.5, 720.4, 736.3, 754.2, 776.0, 783.3, 800.1, 816.0, 843.2, 855.5, 877.2, 891.3, 916.2, 916.5, 928.6, 940.7, 963.8, 962.9, 979.6, 993.6, 1019.0, 1022.4, 1035.9, 1056.4, 1085.3, 1098.3, 1131.5, 1164.9, 1203.1, 1223.7, 1257.6, 1296.5, 1342.5, 1359.0, 1387.8, 1419.1, 1450.6, 1468.1, 1492.1, 1513.6, 1536.5, 1539.9, 1556.7, 1572.4, 1600.1, 1611.2, 1637.4, 1682.3, 1728.5, 1765.6, 1809.2, 1844.0, 1861.3, 1861.2, 1866.6, 1869.1, 1865.4, 1850.7, 1858.8, 1875.8, 1882.6, 1879.4, 1892.7, 1911.4, 1922.7, 1925.0, 1950.0, 1964.8, 1979.1, 1993.1]}};
+const mono='ui-monospace,SF Mono,Menlo,Consolas,monospace';
+const SER={}; let MCAP=null, MCAP_M={}, MCAP_D=null;
 
-def pull_all(op,total,extra=None,base=None):
-    items=[]; page=1
-    while len(items)<total:
-        chunk,_=gk(op,page,10000,extra,base); items+=chunk; page+=1
-        if page>60: break
-        time.sleep(0.3)
-    return items
+function initFromRaw(){
+  ['yetak','cma','rp','yungja','jiya','misu','forced'].forEach(k=>{
+    const d=[],v=[];RAW.dates.forEach((dt,i)=>{if(RAW[k][i]!=null){d.push(dt);v.push(RAW[k][i])}});
+    SER[k]={d,v,f:'M',src:'内置底稿·协会官网'};
+  });
+  SER.hh={d:RAW.hh.dates.slice(),v:RAW.hh.vals.slice(),f:'Q',src:'内置底稿·韩银'};
+  SER.demand=null;SER.time=null;SER.hhloan=null;SER.otherloan=null;SER.nbloan=null;SER.mmf=null;SER.stockfund=null;
+}
+let KOSPI_D=null;
+function buildCombined(){
+  const a=SER.yetak,b=SER.rp;
+  if(!a||!b||!a.d||!b.d){SER.yetakrp=null;return}
+  const bm={};b.d.forEach((dt,i)=>bm[dt]=b.v[i]);
+  const d=[],v=[];
+  a.d.forEach((dt,i)=>{if(bm[dt]!=null&&a.v[i]!=null){d.push(dt);v.push(+(a.v[i]+bm[dt]).toFixed(2))}});
+  SER.yetakrp=d.length?{d,v,f:a.f,src:'预托金＋对客RP 同日加总'}:null;
+}
+function kospiAtDate(dt){
+  if(!KOSPI_D)return null;
+  if(dt.length===7){for(let i=KOSPI_D.d.length-1;i>=0;i--){if(KOSPI_D.d[i].slice(0,7)===dt)return KOSPI_D.v[i]}return null}
+  const i=KOSPI_D.d.indexOf(dt);return i>=0?KOSPI_D.v[i]:null;
+}
+function shiftMonth(ds){const y=+ds.slice(0,4),m=+ds.slice(5,7);const nm=m===1?12:m-1,ny=m===1?y-1:y;
+  return String(ny).padStart(4,'0')+'-'+String(nm).padStart(2,'0')+ds.slice(7)}
+function yoyAccel(dates,ys){
+  let i=ys.length-1;while(i>=0&&ys[i]==null)i--;
+  if(i<0)return null;
+  const tgt=shiftMonth(dates[i]);let j=-1;
+  for(let k=i-1;k>=0;k--){if(dates[k]<=tgt&&ys[k]!=null){j=k;break}}
+  if(j<0){for(let k=i-1;k>=0;k--){if(ys[k]!=null){j=k;break}}}
+  if(j<0)return null;
+  return ys[i]-ys[j];
+}
+function applyExternal(){
+  const X=window.KOREA_DATA; if(!X) return false;
+  if(X.mcap&&X.mcap.d&&X.mcap.d.length){
+    MCAP_D={d:X.mcap.d,v:X.mcap.v};MCAP_M={};
+    X.mcap.d.forEach((dt,i)=>{MCAP_M[dt.slice(0,7)]=X.mcap.v[i]});
+    MCAP={date:X.mcap.d[X.mcap.d.length-1],val:X.mcap.v[X.mcap.v.length-1]};
+  }
+  ['demand','time','hhloan','otherloan','nbloan'].forEach(k=>{if(X[k]&&X[k].d&&X[k].d.length)SER[k]=X[k]});
+  if(X.funds)Object.keys(X.funds).forEach(k=>{const s=X.funds[k];
+    if(s&&s.d&&s.d.length&&(s.f==='D'||!SER[k]||s.d.length>=SER[k].d.length))SER[k]=s});
+  if(X.deriv)Object.keys(X.deriv).forEach(k=>{const s=X.deriv[k];
+    if(s&&s.d&&s.d.length)SER[k]=s});
+  if(X.kospi&&X.kospi.d)KOSPI_D={d:X.kospi.d,v:X.kospi.v};
+  buildCombined();
+  return true;
+}
 
-def series_from_items(items, val_kws, anchor_key):
-    """val_kws: 字段名关键词(小写); 用锚点自动定标"""
-    if not items: return None
-    df=date_field(items[0])
-    if not df: return None
-    fld=None
-    for k in items[0].keys():
-        lk=k.lower()
-        if any(w in lk for w in val_kws): fld=k; break
-    if not fld:
-        dbg(f"字段嗅探失败({anchor_key}): 可用字段={list(items[0].keys())}"); return None
-    tmp={}
-    for it in items:
-        s=str(it.get(df,"")); 
-        try: v=float(str(it.get(fld,"")).replace(",",""))
-        except ValueError: continue
-        if len(s)==8: tmp[f"{s[:4]}-{s[4:6]}-{s[6:8]}"]=v
-    if not tmp: return None
-    d=sorted(tmp); v=[tmp[x] for x in d]
-    sc=snap_scale(v[-1],ANCHOR.get(anchor_key,100))
-    if sc is None: return None
-    return {"d":d,"v":[round(x*sc,3) for x in v],"f":"D","src":f"data.go.kr 협회·{fld}"}
+/* ================= 工具 ================= */
+const last=a=>{for(let i=a.length-1;i>=0;i--)if(a[i]!=null)return{v:a[i],i};return{v:null,i:-1}};
+const fmt=(v,dd=1)=>v==null?'—':v.toLocaleString('zh-CN',{minimumFractionDigits:dd,maximumFractionDigits:dd});
+const pct=v=>v==null?'—':(v>0?'+':'')+(v*100).toFixed(1)+'%';
+const pillCls=v=>v==null?'pn':(v>0?'pu':'pd');
+function yoySeries(dates,vals){
+  const idx={};dates.forEach((d,i)=>idx[d]=i);
+  return vals.map((v,i)=>{
+    if(v==null)return null;const d=dates[i];
+    const y=(parseInt(d.slice(0,4))-1)+d.slice(4);
+    if(idx[y]!=null&&vals[idx[y]]!=null)return (v/vals[idx[y]]-1)*100;
+    if(d.length===10){let lo=0,hi=i;while(lo<hi){const m=(lo+hi+1)>>1;if(dates[m]<=y)lo=m;else hi=m-1;}
+      if(dates[lo]<=y&&vals[lo]!=null){
+        const gap=(new Date(y)-new Date(dates[lo]))/86400000;
+        if(gap>=0&&gap<15)return (v/vals[lo]-1)*100;}}
+    return null;});
+}
+function yoyLatest(dates,vals){const ys=yoySeries(dates,vals);for(let i=ys.length-1;i>=0;i--)if(ys[i]!=null)return ys[i]/100;return null}
+function mcapAtDate(d){
+  if(!MCAP_D)return MCAP_M[d.slice(0,7)]||null;
+  if(d.length===7)return MCAP_M[d]||null;
+  const A=MCAP_D.d;if(d<A[0])return null;let lo=0,hi=A.length-1;
+  while(lo<hi){const m=(lo+hi+1)>>1;if(A[m]<=d)lo=m;else hi=m-1;}
+  return MCAP_D.v[lo];
+}
 
-def _num(x):
-    try: return float(str(x).replace(",",""))
-    except (TypeError,ValueError): return None
+/* ================= 指标注册 ================= */
+const S=[
+ {divider:1,label:'银行体系 · 韩国银行 · 月频/季频'},
+ {no:1,key:'demand',title:'活期存款（存款银行）'},
+ {no:2,key:'time',title:'定期及储蓄性存款'},
+ {no:3,key:'hh',title:'家庭信用总额（가계신용·季频）'},
+ {no:4,key:'hhloan',title:'存款银行家庭贷款'},
+ {no:5,key:'otherloan',title:'其他贷款（기타대출·信用贷/负存折等非房贷）'},
+ {no:6,key:'nbloan',title:'非银行存款机构家庭贷款（二金融圈）'},
+ {divider:1,label:'券商数据 · 金融投资协会 · 日频'},
+ {no:7,key:'yetakrp',title:'投资者预托金＋对客RP合计（券商客户现金总量）'},
+ {no:8,key:'yetak',title:'投资者预托金（투자자예탁금）'},
+ {no:9,key:'rp',title:'对客户RP销售余额（客户回购理财）'},
+ {no:10,key:'cma',title:'CMA账户余额（综合资产管理账户）'},
+ {no:11,key:'mmf',title:'MMF净资产（货币市场基金）'},
+ {no:12,key:'stockfund',title:'股票型基金净资产'},
+ {no:13,key:'yungja',title:'信用交易融资余额（融资）'},
+ {no:14,key:'jiya',title:'预托证券担保融资余额（股票质押）'},
+ {no:15,key:'misu',title:'委托买卖未收金余额（赊欠额）'},
+ {no:16,key:'forced',title:'未收金对强制平仓比重（强平比重）',type:'ratio'},
+ {divider:1,label:'杠杆产品 · 期货 / 杠杆ETF / 结构化 · 金融委/协会'},
+ {no:17,key:'futoi',title:'股指与个股期货未平仓名义金额（KOSPI200·三星电子·SK海力士）'},
+ {no:18,key:'levetf',title:'杠杆ETF总市值'},
+ {no:19,key:'els',title:'ELS未偿余额（股票挂钩证券·원금비보장형）'},
+ {no:20,key:'dls',title:'DLS未偿余额（衍生结合证券）'},
+];
+const GATED=['futoi','levetf','els','dls','nbloan','mmf','stockfund','yetakrp'];
+function activeS(){return S.filter(s=>s.divider||!GATED.includes(s.key)||(SER[s.key]&&SER[s.key].d&&SER[s.key].d.length))}
+const freqLabel=f=>f==='D'?'日频':f==='Q'?'季频':'月频';
 
-def fetch_futoi():
-    print("· 期货未平仓名义规模(日频, 파생상품시세정보)…", flush=True)
-    EXCL=("미니","마이크","스프레드","옵션","위클리","섹터","배당","변동","야간","유로")
-    groups=[("코스피200",250000.0),("삼성전자",10.0),("SK하이닉스",10.0)]
-    daily={}
-    oi_field=None; nm_field=None; df=None
-    for kw,mult in groups:
-        try:
-            items,total=gk("getStockFuturesPriceInfo",1,3,{"likeItmsNm":kw},DERIV_BASE)
-            if total==0: dbg(f"futoi:{kw} total=0"); continue
-            rows=pull_all("getStockFuturesPriceInfo",total,{"likeItmsNm":kw},DERIV_BASE)
-        except Exception as e:
-            dbg(f"futoi:{kw} {str(e)[:100]}"); continue
-        if not rows: continue
-        if oi_field is None:
-            dbg(f"futoi字段样例: {list(rows[0].keys())}")
-            df=date_field(rows[0])
-            nm_field=next((k for k in rows[0] if "itmsnm" in k.lower() or k.lower()=="itmsnm"),None) or                      next((k for k in rows[0] if "nm" in k.lower()),None)
-            oi_field=next((k for k in rows[0] if "opnint" in k.lower() or "intrst" in k.lower()),None)
-            cl_field=next((k for k in rows[0] if k.lower()=="clpr"),None) or                      next((k for k in rows[0] if "clpr" in k.lower()),None)
-            if not (df and nm_field and oi_field and cl_field):
-                dbg(f"futoi字段嗅探失败 df={df} nm={nm_field} oi={oi_field} cl={cl_field}"); return {}
-        nms=sorted({str(r.get(nm_field,"")) for r in rows})
-        dbg(f"futoi:{kw} 名称样本({len(nms)}种): "+", ".join(nms[:12]))
-        pcs=sorted({str(r.get("prdCtg","")) for r in rows})
-        dbg(f"futoi:{kw} prdCtg取值: {pcs[:8]}")
-        kwn=kw.replace(" ","")
-        pat=re.compile("^"+re.escape(kwn)+"F[0-9]{6}([(][0-9 ]+[)])?$")
-        n=0
-        for r in rows:
-            nm2=str(r.get(nm_field,"")).replace(" ","")
-            if not pat.match(nm2): continue
-            if "야간" in str(r.get("prdCtg","")): continue
-            t=str(r.get(df,""))
-            oi=_num(r.get(oi_field)); cl=_num(r.get(cl_field))
-            if len(t)!=8 or oi is None or cl is None: continue
-            key=f"{t[:4]}-{t[4:6]}-{t[6:8]}"
-            daily[key]=daily.get(key,0.0)+cl*mult*oi
-            n+=1
-        dbg(f"futoi:{kw} 纳入{n}行")
-    if not daily: return {}
-    dd=sorted(daily); raw=[daily[x] for x in dd]
-    sc=calibrate("futoi", raw[-1], "원")
-    if sc is None: dbg(f"futoi数量级异常 最新原始={raw[-1]}"); return {}
-    vv=[round(x*sc,2) for x in raw]
-    print(f"  ✓ futoi 日频 {len(dd)}点 ({dd[0]}~{dd[-1]}) 最新{vv[-1]:,.1f}万亿")
-    return {"futoi":{"d":dd,"v":vv,"f":"D","src":"金融委·선물시세 K200×25万+个股×10 跨月加总"}}
+/* ================= 图表 ================= */
+let charts={};
+const tick=v=>{v=Number(v);v=parseFloat(v.toPrecision(12));return Math.abs(v)>=1000?v.toLocaleString('zh-CN'):String(v)};
+const axFont={font:{family:mono,size:11},color:'#5E6D86'};
+const ZOOM_OPT={pan:{enabled:true,mode:'x',modifierKey:null},zoom:{wheel:{enabled:true,speed:.08},pinch:{enabled:true},drag:{enabled:false},mode:'x'},limits:{x:{minRange:5}}};
+function mkChart(id,cfg){
+  if(charts[id])charts[id].destroy();
+  cfg.options=cfg.options||{};cfg.options.plugins=cfg.options.plugins||{};
+  cfg.options.plugins.zoom=ZOOM_OPT;
+  const el=document.getElementById(id);
+  charts[id]=new Chart(el,cfg);
+  el.ondblclick=()=>charts[id].resetZoom();
+}
+function dualChart(id,labels,lv,yy,color){
+  const ds=[
+   {label:'总额(T)',data:lv,borderColor:color,borderWidth:1.6,pointRadius:0,spanGaps:true,yAxisID:'y'},
+   {label:'YoY(%)',data:yy,borderColor:'#9AA7BC',borderDash:[4,3],borderWidth:1.1,pointRadius:0,spanGaps:true,yAxisID:'y1'}];
+  const ks=labels.map(dt=>kospiAtDate(dt));
+  const hasK=ks.some(x=>x!=null);
+  if(hasK)ds.push({label:'KOSPI指数(log)',data:ks,borderColor:'rgba(107,142,111,.85)',borderWidth:1.2,pointRadius:0,spanGaps:true,fill:false,yAxisID:'y2'});
+  const sc={x:{ticks:{...axFont,maxTicksLimit:10,autoSkip:true},grid:{display:false}},
+    y:{position:'left',ticks:{...axFont,maxTicksLimit:6,callback:v=>tick(v)},grid:{color:'#E9EEF5'}},
+    y1:{position:'right',ticks:{...axFont,maxTicksLimit:6,callback:v=>tick(v)+'%'},grid:{display:false}}};
+  if(hasK)sc.y2={type:'logarithmic',position:'right',ticks:{...axFont,maxTicksLimit:6,callback:v=>tick(v),color:'#6B8E6F'},grid:{display:false}};
+  mkChart(id,{type:'line',data:{labels,datasets:ds},
+  options:{responsive:true,maintainAspectRatio:false,animation:false,interaction:{mode:'index',intersect:false},
+   plugins:{legend:{display:true,labels:{boxWidth:16,boxHeight:2,font:{size:11},color:'#5E6D86'}},
+    tooltip:{titleFont:{family:mono},bodyFont:{family:mono},callbacks:{label:c=>c.dataset.label.startsWith('KOSPI')?` KOSPI ${c.parsed.y==null?'—':tick(c.parsed.y)}`:(c.dataset.label.includes('YoY')?` YoY ${c.parsed.y==null?'—':c.parsed.y.toFixed(1)+'%'}`:` 总额 ${fmt(c.parsed.y)} T`)}}},
+   scales:sc}});
+}
+function ratioChart(id,labels,vals){
+  mkChart(id,{type:'line',data:{labels,datasets:[{data:vals,borderColor:'#A8721C',backgroundColor:'rgba(168,114,28,.08)',fill:true,borderWidth:1.6,pointRadius:0,spanGaps:true}]},
+  options:{responsive:true,maintainAspectRatio:false,animation:false,
+   plugins:{legend:{display:false},tooltip:{titleFont:{family:mono},bodyFont:{family:mono},callbacks:{label:c=>` 占市值 ${c.parsed.y==null?'—':c.parsed.y.toFixed(2)+'%'}`}}},
+   scales:{x:{ticks:{...axFont,maxTicksLimit:10,autoSkip:true},grid:{display:false}},
+    y:{ticks:{...axFont,maxTicksLimit:6,callback:v=>tick(v)+'%'},grid:{color:'#E9EEF5'}}}}});
+}
 
-def fetch_levetf():
-    print("· 杠杆ETF总市值(日频, 증권상품시세정보)…", flush=True)
-    try:
-        items,total=gk("getETFPriceInfo",1,3,{"likeItmsNm":"레버리지"},SECPRD_BASE)
-        if total==0: dbg("levetf total=0"); return {}
-        rows=pull_all("getETFPriceInfo",total,{"likeItmsNm":"레버리지"},SECPRD_BASE)
-    except Exception as e:
-        dbg(f"levetf {str(e)[:100]}"); return {}
-    if not rows: return {}
-    dbg(f"levetf字段样例: {list(rows[0].keys())}")
-    df=date_field(rows[0])
-    mk=next((k for k in rows[0] if "mrkttotamt" in k.lower()),None) or        next((k for k in rows[0] if "tot" in k.lower() and "amt" in k.lower()),None)
-    if not (df and mk): dbg(f"levetf字段嗅探失败 df={df} mk={mk}"); return {}
-    daily={}
-    for r in rows:
-        t=str(r.get(df,"")); v=_num(r.get(mk))
-        if len(t)!=8 or v is None: continue
-        key=f"{t[:4]}-{t[4:6]}-{t[6:8]}"
-        daily[key]=daily.get(key,0.0)+v
-    if not daily: return {}
-    dd=sorted(daily); raw=[daily[x] for x in dd]
-    sc=calibrate("levetf", raw[-1], "원")
-    if sc is None: dbg(f"levetf数量级异常 最新原始={raw[-1]}"); return {}
-    vv=[round(x*sc,2) for x in raw]
-    print(f"  ✓ levetf 日频 {len(dd)}点 ({dd[0]}~{dd[-1]}) 最新{vv[-1]:,.1f}万亿")
-    return {"levetf":{"d":dd,"v":vv,"f":"D","src":"金融委·ETF시세 名称含레버리지 市值加总"}}
+/* ================= 渲染 ================= */
+function buildCards(){
+  document.getElementById('rows').innerHTML=activeS().map(s=>{
+    if(s.divider)return `<div class="secdiv"><span>${s.label}</span></div>`;
+    if(s.type==='ratio')return `<div class="card"><div class="chead"><span class="cnum">16</span><span class="ctitle">${s.title}</span><span class="freq" id="freq-forced"></span><div class="stats" id="stats-forced"></div></div>
+      <div class="chlbl">比例时序（%）</div><div class="cv" style="height:260px"><canvas id="ch-forced"></canvas></div></div>`;
+    return `<div class="card" id="card-${s.key}"><div class="chead"><span class="cnum">${String(s.no).padStart(2,'0')}</span><span class="ctitle">${s.title}</span><span class="freq" id="freq-${s.key}"></span><div class="stats" id="stats-${s.key}"></div></div>
+     <div class="charts">
+      <div><div class="chlbl">总额（左轴，T）＋ YoY（右轴，%）＋ KOSPI指数（绿·对数右二轴）</div><div class="cv"><canvas id="lv-${s.key}"></canvas><div class="nodata" id="nd1-${s.key}" style="display:none"></div></div></div>
+      <div><div class="chlbl">占KOSPI总市值（%）</div><div class="cv"><canvas id="rt-${s.key}"></canvas><div class="nodata" id="nd2-${s.key}" style="display:none"></div></div></div>
+     </div></div>`;
+  }).join('');
+}
+const statHTML=(d,v,y,r)=>`<div class="stat"><div class="l">最新余额 · ${d}</div><div class="n">${fmt(v)}<small> T</small></div></div>
+ <div class="stat"><div class="l">YoY</div><div class="n"><span class="pill ${pillCls(y)}">${pct(y)}</span></div></div>
+ <div class="stat"><div class="l">占市值</div><div class="n">${r==null?'<small>待市值</small>':r.toFixed(2)+'%'}</div></div>`;
+function renderSeries(s){
+  const d=SER[s.key],card=document.getElementById('card-'+s.key),
+   nd1=document.getElementById('nd1-'+s.key),nd2=document.getElementById('nd2-'+s.key);
+  if(!d||!d.d.length){card.classList.add('pending');
+    document.getElementById('freq-'+s.key).textContent='待接入';
+    document.getElementById('stats-'+s.key).innerHTML=statHTML('—',null,null,null);
+    nd1.style.display='flex';nd1.innerHTML='此序列由 data.js 提供：本地运行 update_data.py，或使用GitHub托管版（自动每日更新）';
+    nd2.style.display='flex';nd2.textContent='待数据';return}
+  card.classList.remove('pending');nd1.style.display='none';
+  const {v,i}=last(d.v);const y=yoyLatest(d.d,d.v);
+  const mc=mcapAtDate(d.d[i]);const r=(v!=null&&mc)?v/mc*100:null;
+  document.getElementById('stats-'+s.key).innerHTML=statHTML(d.d[i],v,y,r);
+  document.getElementById('freq-'+s.key).textContent=freqLabel(d.f)+' · '+d.src.split('·')[0];
+  const ys=yoySeries(d.d,d.v);const acc=yoyAccel(d.d,ys);
+  dualChart('lv-'+s.key,d.d,d.v,ys,(acc!=null&&acc>0)?'#C93A36':'#24406B');
+  const hasM=MCAP_D||Object.keys(MCAP_M).length;
+  if(hasM){const rs=d.d.map((dt,ix)=>{const m=mcapAtDate(dt);return(d.v[ix]!=null&&m)?+(d.v[ix]/m*100).toFixed(3):null});
+    if(rs.some(x=>x!=null)){nd2.style.display='none';ratioChart('rt-'+s.key,d.d,rs)}
+    else{nd2.style.display='flex';nd2.textContent='与市值序列无重叠期'}}
+  else{nd2.style.display='flex';nd2.textContent='运行 update_data.py 拉取市值后自动生成'}
+}
+function renderForced(){
+  const d=SER.forced;const {v,i}=last(d.v);
+  document.getElementById('freq-forced').textContent=freqLabel(d.f)+' · 协会';
+  document.getElementById('stats-forced').innerHTML=
+   `<div class="stat"><div class="l">最新比例 · ${d.d[i]}</div><div class="n">${v==null?'—':v.toFixed(1)+'%'}</div></div>
+    <div class="stat"><div class="l">口径</div><div class="n"><small>协会披露原值</small></div></div>
+    <div class="stat"><div class="l">读法</div><div class="n"><small>飙升＝强平潮</small></div></div>`;
+  mkChart('ch-forced',{type:'bar',data:{labels:d.d,datasets:[{data:d.v,backgroundColor:'#A8721C'}]},
+   options:{responsive:true,maintainAspectRatio:false,animation:false,
+    plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>` ${c.parsed.y==null?'—':c.parsed.y.toFixed(1)+'%'}`}}},
+    scales:{x:{ticks:{...axFont,maxTicksLimit:10,autoSkip:true},grid:{display:false}},y:{ticks:{...axFont,maxTicksLimit:6,callback:v=>tick(v)+'%'},grid:{color:'#E9EEF5'}}}}});
+}
+function forcedAmtSeries(){
+  const m=SER.misu,f=SER.forced;
+  if(!m||!f||!m.d||!f.d)return null;
+  const fm={};f.d.forEach((dt,i)=>fm[dt]=f.v[i]);
+  const d=[],v=[];
+  m.d.forEach((dt,i)=>{if(fm[dt]!=null&&m.v[i]!=null){d.push(dt);v.push(+(m.v[i]*fm[dt]/100*1000).toFixed(1))}});
+  return d.length?{d,v}:null;   // 单位: B韩元(억×10)
+}
+function buildTape(){
+  const items=[['融资余额','yungja'],['股票质押','jiya'],['预托金+RP','yetakrp'],['赊欠额','misu'],['强平额(估算)','__f'],['KOSPI市值','__m']];
+  document.getElementById('tape').innerHTML=items.map(([n,k])=>{
+    if(k==='__m'){if(!MCAP)return `<div class="chip"><div class="k">KOSPI市值</div><div class="v">—</div><span class="y pn">待脚本拉取</span></div>`;
+      return `<div class="chip"><div class="k">${n} · ${MCAP.date}</div><div class="v">${fmt(MCAP.val,0)}<small> T</small></div><span class="y pn">日频</span></div>`}
+    if(k==='__f'){const s=forcedAmtSeries();if(!s)return '';
+      const {v,i}=last(s.v);const y=yoyLatest(s.d,s.v);
+      return `<div class="chip"><div class="k">${n} · ${s.d[i]}</div><div class="v">${fmt(v)}<small> B</small></div><span class="y ${pillCls(y)}">YoY ${pct(y)}</span></div>`}
+    const d=SER[k];if(!d)return '';const {v,i}=last(d.v);const y=yoyLatest(d.d,d.v);
+    return `<div class="chip"><div class="k">${n} · ${d.d[i]}</div><div class="v">${fmt(v)}<small> T</small></div><span class="y ${pillCls(y)}">YoY ${pct(y)}</span></div>`}).join('');
+}
+function renderAll(){buildTape();activeS().forEach(s=>{if(s.divider)return;s.type==='ratio'?renderForced():renderSeries(s)})}
 
-def _ymkey(raw):
-    t=re.sub(r"\\D","",str(raw))
-    if len(t)>=6 and t[:2] in ("19","20"): return f"{t[:4]}-{t[4:6]}"
-    return None
+initFromRaw();
+const ext=applyExternal();
+buildCards();renderAll();
+document.getElementById('status').textContent = ext
+ ? ('数据文件已加载 · 更新于 '+(window.KOREA_DATA.meta&&window.KOREA_DATA.meta.fetched_at||'?')+' · 频率见各卡片徽章 · 图表可滚轮缩放/拖动平移/双击复位 · 再次更新: 运行 python update_data.py 后刷新本页')
+ : '当前为内置底稿(协会月频, 截至2026-06) · 获取日频/存款/市值: 把本页与 update_data.py 放同一文件夹, 运行 python update_data.py 生成 data.js 后刷新本页';
 
-def fetch_fund2():
-    print("· 基金净资产(MMF/股票型, 협회 getFundTotalNetEssetInfo)…", flush=True)
-    try:
-        items,total=gk("getFundTotalNetEssetInfo",1,3)
-        if total==0: dbg("fund2 total=0"); return {}
-        rows=pull_all("getFundTotalNetEssetInfo",total)
-    except Exception as e:
-        dbg(f"fund2 {str(e)[:100]}"); return {}
-    if not rows: return {}
-    dbg(f"fund2字段样例: {list(rows[0].keys())}")
-    df=date_field(rows[0])
-    tp=next((k for k in rows[0] if "ctg" in k.lower() or "tpcd" in k.lower() or "fnd" in k.lower() or "tp" in k.lower()),None)
-    amt=next((k for k in rows[0] if "nast" in k.lower() or ("net" in k.lower() and "amt" in k.lower())),None) or \
-        next((k for k in rows[0] if "amt" in k.lower() or "bal" in k.lower()),None)
-    if not (df and amt): dbg(f"fund2字段嗅探失败 df={df} tp={tp} amt={amt}"); return {}
-    tvals=sorted({str(r.get(tp,"")) for r in rows}) if tp else []
-    if tp: dbg(f"fund2类型{tp}取值: {tvals[:15]}")
-    out={}
-    for key,kws,label in (("mmf",("MMF","단기금융"),"MMF"),("stockfund",("주식",),"주식형")):
-        want=[v for v in tvals if any(w in v for w in kws)] if tp else []
-        if tp and not want: dbg(f"fund2:{key} 类型未匹配"); continue
-        daily={}
-        for r in rows:
-            if tp and str(r.get(tp,"")) not in want: continue
-            t=str(r.get(df,"")); v=_num(r.get(amt))
-            if v is None: continue
-            if len(t)==8: kd=f"{t[:4]}-{t[4:6]}-{t[6:8]}"
-            elif len(t)==6: kd=f"{t[:4]}-{t[4:6]}"
-            else: continue
-            daily[kd]=daily.get(kd,0.0)+v
-        if not daily: continue
-        dd=sorted(daily); raw=[daily[x] for x in dd]
-        sc=calibrate(key,raw[-1],"원")
-        if sc is None: dbg(f"fund2:{key}数量级异常 原始={raw[-1]}"); continue
-        vv=[round(x*sc,2) for x in raw]
-        fq="D" if len(dd[0])==10 else "M"
-        out[key]={"d":dd,"v":vv,"f":fq,"src":f"협회·펀드순자산 {label}"}
-        print(f"  ✓ {key} {fq}频 {len(dd)}点 最新{vv[-1]:,.1f}万亿")
-    return out
-
-def fetch_ovsderiv():
-    print("· 海外衍生品交易实绩(협회 getDerivationProductTradingInfo)…", flush=True)
-    try:
-        items,total=gk("getDerivationProductTradingInfo",1,3)
-        if total==0: dbg("ovsderiv total=0"); return {}
-        rows=pull_all("getDerivationProductTradingInfo",total)
-    except Exception as e:
-        dbg(f"ovsderiv {str(e)[:100]}"); return {}
-    if not rows: return {}
-    dbg(f"ovsderiv字段样例: {list(rows[0].keys())} 首行: {str(rows[0])[:200]}")
-    df=date_field(rows[0])
-    ym=None
-    if not df:
-        for k,v in rows[0].items():
-            sv=str(v)
-            if len(sv)==6 and sv.isdigit() and sv.startswith(("19","20")): ym=k; break
-    amt=next((k for k in rows[0] if "amt" in k.lower() or "prc" in k.lower()),None)
-    if not (df or ym) or not amt: dbg(f"ovsderiv字段嗅探失败 df={df} ym={ym} amt={amt}"); return {}
-    monthly={}
-    for r in rows:
-        v=_num(r.get(amt))
-        if v is None: continue
-        t=str(r.get(df or ym,""))
-        if len(t)==8: kd=f"{t[:4]}-{t[4:6]}"
-        elif len(t)==6: kd=f"{t[:4]}-{t[4:6]}"
-        else: continue
-        monthly[kd]=monthly.get(kd,0.0)+v
-    if not monthly: return {}
-    dd=sorted(monthly); raw=[monthly[x] for x in dd]
-    sc=calibrate("ovsderiv",raw[-2] if len(raw)>1 else raw[-1],"원")
-    if sc is None:
-        dbg(f"ovsderiv数量级待定标 最新原始={raw[-1]:,.0f} (可能为美元或特殊单位, 见字段样例)"); return {}
-    vv=[round(x*sc,1) for x in raw]
-    print(f"  ✓ ovsderiv 月度 {len(dd)}点 最新{vv[-1]:,.1f}万亿")
-    return {"ovsderiv":{"d":dd,"v":vv,"f":"M","src":"협회·해외파생상품 거래실적 月度加总(口径待核)"}}
-
-
-def _els_dls_core(op, key, label):
-    try:
-        items,total=gk(op,1,3)
-        if total==0: dbg(f"{key} total=0"); return {}
-        rows=pull_all(op,total)
-    except Exception as e:
-        dbg(f"{key} {str(e)[:100]}"); return {}
-    if not rows: return {}
-    dbg(f"{key}字段样例: {list(rows[0].keys())} 首行: {str(rows[0])[:150]}")
-    amt=next((k for k in rows[0] if k.lower()=="amt"),None) or \
-        next((k for k in rows[0] if "amt" in k.lower()),None)
-    ctg=next((k for k in rows[0] if "elbels" in k.lower() or "dlbdls" in k.lower()),None) or \
-        next((k for k in rows[0] if k.lower().startswith("ctg") and "psub" not in k.lower()),None)
-    if not amt or not ctg: dbg(f"{key}字段缺失 amt={amt} ctg={ctg}"); return {}
-    vals=sorted({str(r.get(ctg,"")) for r in rows})
-    pres=sorted({str(r.get("presCtg","")) for r in rows})
-    dbg(f"{key}分类: {vals[:8]} | presCtg: {pres[:8]}")
-    want_ctg=next((v for v in vals if "비보장" in v),None)
-    want_pres=next((p for p in pres if "미상환" in p or "잔고" in p),None) or \
-              next((p for p in pres if "발행" in p),None)
-    if want_ctg is None or want_pres is None:
-        dbg(f"{key}分类锁定失败 ctg={want_ctg} pres={want_pres}"); return {}
-    monthly={}
-    for r in rows:
-        if str(r.get(ctg,""))!=want_ctg: continue
-        if str(r.get("presCtg",""))!=want_pres: continue
-        v=_num(r.get(amt))
-        if v is None: continue
-        kd=_ymkey(r.get("basDt"))
-        if not kd: continue
-        monthly[kd]=monthly.get(kd,0.0)+v
-    if not monthly: dbg(f"{key}过滤后为空 ({want_ctg}/{want_pres})"); return {}
-    dd=sorted(monthly); raw=[monthly[x] for x in dd]
-    sc=calibrate(key, raw[-2] if len(raw)>1 else raw[-1], "원")
-    if sc is None: dbg(f"{key}数量级异常 原始={raw[-1]}"); return {}
-    vv=[round(x*sc,2) for x in raw]
-    kind="未偿余额" if ("미상환" in want_pres or "잔고" in want_pres) else "发行额"
-    print(f"  ✓ {key} 月度{kind} {len(dd)}点 ({dd[0]}~{dd[-1]}) 最新{vv[-1]:,.2f}万亿 · {want_ctg}/{want_pres}")
-    return {key:{"d":dd,"v":vv,"f":"M","src":f"협회·{label}({want_ctg}) {want_pres}"}}
-
-def fetch_els():
-    print("· ELS(협회 getELSAndELBInfo)…", flush=True)
-    return _els_dls_core("getELSAndELBInfo","els","ELS")
-
-def fetch_dls():
-    print("· DLS(협회 getDLSAndDLBInfo)…", flush=True)
-    return _els_dls_core("getDLSAndDLBInfo","dls","DLS")
-
-def fetch_deriv():
-    out={}
-    if not DATA_GO_KR_KEY.strip(): return out
-    for fn in (fetch_futoi, fetch_levetf, fetch_els, fetch_dls, fetch_fund2):
-        try: out.update(fn())
-        except Exception as e: dbg(f"{fn.__name__} 顶层异常 {str(e)[:120]}")
-    return out
-
-def fetch_funds_daily():
-    print("· 协会资金面(日频, data.go.kr)…", flush=True)
-    out={}
-    key_check()
-    op,total=probe("fund")
-    if op:
-        items=pull_all(op,total)
-        if items: print(f"  字段样例(증시자금): {list(items[0].keys())}")
-        for key,kws in (("yetak",["dpsg","dpst","depo","invst","ivst"]),("rp",["rp","repo"]),
-                        ("misu",["ucolmny","ucol","msu","misu"])):
-            s=series_from_items(items,kws,key)
-            if s: out[key]=s; print(f"  ✓ {key} 日频 {len(s['d'])}点 最新{s['v'][-1]:,.1f}万亿")
-        # 强平/垫付比重: 接口原生比率字段(RlImpt), 不做万亿换算
-        if items:
-            df=date_field(items[0])
-            fld=next((k for k in items[0] if "rlimpt" in k.lower()),None)
-            if df and fld:
-                tmp={}
-                for it2 in items:
-                    t=str(it2.get(df,""))
-                    try: v=float(str(it2.get(fld,"")).replace(",",""))
-                    except ValueError: continue
-                    if len(t)==8: tmp[f"{t[:4]}-{t[4:6]}-{t[6:8]}"]=v
-                if tmp:
-                    dd=sorted(tmp); vv=[tmp[x] for x in dd]
-                    med=sorted(vv)[len(vv)//2]
-                    if med<1: vv=[round(x*100,2) for x in vv]   # 小数比率→百分比
-                    if 0.05<sorted(vv)[len(vv)//2]<60:
-                        out["forced"]={"d":dd,"v":[round(x,2) for x in vv],"f":"D","src":f"data.go.kr 협회·{fld}"}
-                        print(f"  ✓ forced 日频 {len(dd)}点 最新{vv[-1]:.1f}%")
-                    else: dbg(f"forced 比率量级异常 中位数={sorted(vv)[len(vv)//2]}")
-    op,total=probe("credit")
-    if op:
-        items=pull_all(op,total)
-        if items: print(f"  字段样例(신용공여): {list(items[0].keys())}")
-        for key,kws in (("yungja",["fnc","loan","crdt"]),("jiya",["scrt","scty","secu","pledge","mrtg","cltr"])):
-            s=series_from_items(items,kws,key)
-            if s: out[key]=s; print(f"  ✓ {key} 日频 {len(s['d'])}点 最新{s['v'][-1]:,.1f}万亿")
-    op,total=probe("cma")
-    if op:
-        items=pull_all(op,total)
-        if items:
-            tgts=sorted({str(it2.get("mngInvTgt","")) for it2 in items})
-            ctgs=sorted({str(it2.get("invrCtg","")) for it2 in items})
-            dbg(f"CMA维度 운용대상={tgts} 투자자구분={ctgs}")
-            tot_tgt=next((t for t in tgts if any(w in t for w in ("합계","전체","계"))),None)
-            tot_ctg=next((c for c in ctgs if any(w in c for w in ("합계","전체","계"))),None)
-            tmp={}
-            for it2 in items:
-                t=str(it2.get("basDt",""))
-                if len(t)!=8: continue
-                if tot_tgt and str(it2.get("mngInvTgt",""))!=tot_tgt: continue
-                if tot_ctg and str(it2.get("invrCtg",""))!=tot_ctg: continue
-                try: v=float(str(it2.get("actBal","")).replace(",",""))
-                except ValueError: continue
-                key2=f"{t[:4]}-{t[4:6]}-{t[6:8]}"
-                tmp[key2]=tmp.get(key2,0.0)+v
-            if tmp:
-                dd=sorted(tmp); raw=[tmp[x] for x in dd]
-                sc=calibrate("cma",raw[-1],"원")
-                if sc:
-                    vv=[round(x*sc,2) for x in raw]
-                    # 锚点验证: 2026-06月末应≈110.5
-                    junes=[i for i,x in enumerate(dd) if x.startswith("2026-06")]
-                    ok = (not junes) or abs(vv[junes[-1]]-110.5)/110.5<0.2
-                    if ok:
-                        out["cma"]={"d":dd,"v":vv,"f":"D","src":"data.go.kr 협회·actBal聚合"}
-                        print(f"  ✓ cma 日频 {len(dd)}点 最新{vv[-1]:,.1f}万亿")
-                    else: dbg(f"CMA锚点验证失败: 2026-06末={vv[junes[-1]]} vs 底稿110.5")
-                else: dbg(f"CMA数量级异常 原始最新={raw[-1]}")
-    if not out:
-        print("  ✗ 日频探测失败(操作名未命中或密钥未审批)。请打开数据集页面→상세기능(Swagger)查看真实操作名,")
-        print("    替换脚本顶部 OP_CANDS 中对应候选列表首位后重跑: https://www.data.go.kr/data/15094809/openapi.do")
-    return out
-
-# ---------------------------- 主流程 ----------------------------
-
-
-
-
-def main():
-    out={"meta":{"fetched_at":dt.datetime.now().strftime("%Y-%m-%d %H:%M"),"notes":[],"debug":DEBUG}}
-    try:
-        out["mcap"]=fetch_mcap()
-        if KOSPI_OUT: out["kospi"]=KOSPI_OUT
-    except Exception as e: print(f"  ✗ 市值失败: {e}"); out["meta"]["notes"].append(f"mcap失败:{e}")
-    try: out.update(fetch_deposits())
-    except Exception as e: print(f"  ✗ 存款失败: {e}"); out["meta"]["notes"].append(f"存款失败:{e}")
-    try: out.update(fetch_hhloan())
-    except Exception as e: print(f"  ✗ 家庭贷款失败: {e}"); out["meta"]["notes"].append(f"家庭贷款失败:{e}")
-    funds={}
-    if DATA_GO_KR_KEY.strip():
-        try: funds=fetch_funds_daily()
-        except Exception as e: print(f"  ✗ 日频协会数据失败: {e}")
-    try:
-        m=fetch_funds_ecos()
-        for k,v in m.items():
-            if k not in funds: funds[k]=v   # 日频优先, 月频补缺
-    except Exception as e: print(f"  ✗ ECOS协会月频失败: {e}")
-    out["funds"]=funds
-    out["deriv"] = fetch_deriv()
-
-    print("\n========== 序列体检报告 ==========")
-    def rep(k,v):
-        if v and v.get("d"): print(f"  {k:8s} {v['f']} {len(v['d']):>6}点  {v['d'][0]} ~ {v['d'][-1]}  最新={v['v'][-1]:,}")
-        else: print(f"  {k:8s} 缺失")
-    rep("mcap",out.get("mcap")); rep("kospi",out.get("kospi")); rep("demand",out.get("demand")); rep("time",out.get("time")); rep("hhloan",out.get("hhloan")); rep("nbloan",out.get("nbloan")); rep("otherloan",out.get("otherloan"))
-    for k in ("yetak","yungja","jiya","rp","misu","cma","forced"): rep(k,(out.get("funds") or {}).get(k))
-    for k in ("futoi","levetf","els","dls","mmf","stockfund"): rep(k,(out.get("deriv") or {}).get(k))
-    print("==================================\n")
-    with open("data.js","w",encoding="utf-8") as f:
-        f.write("window.KOREA_DATA=");json.dump(out,f,ensure_ascii=False,separators=(",",":"));f.write(";")
-    with open("data_backup.json","w",encoding="utf-8") as f:
-        json.dump(out,f,ensure_ascii=False)
-    print("\n完成 → 已写入 data.js (与HTML同目录时网页自动加载)")
-    print("抽查建议: 打开 freesis.kofia.or.kr 与 ecos.bok.or.kr 各核对1-2个最新值")
-
-if __name__=="__main__":
-    main()
+</script>
+</body>
+</html>
