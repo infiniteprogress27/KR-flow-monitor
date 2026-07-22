@@ -13,6 +13,7 @@
          → 免费注册 data.go.kr → 搜「금융투자협회종합통계」(编号15094809) → 활용신청(自动批准)
 """
 import re
+import os
 import json, math, os, sys, time, datetime as dt
 try:
     import requests
@@ -37,7 +38,7 @@ ANCHOR = {"yetak":121.6, "yungja":37.3, "jiya":25.5, "rp":108.8, "misu":1.3, "cm
 
 
 # 合理区间(万亿韩元): 数量级校准的硬约束
-RANGE = {"mcap":(800,12000),"kospi":(300,20000),"demand":(200,2000),"time":(400,3000),"hhloan":(600,2500),"otherloan":(80,1200),"futoi":(10,800),"levetf":(2,200),"els":(1,150),"nbloan":(80,900),"mmf":(30,400),"stockfund":(20,500),"ovsderiv":(30,2000),"dls":(0.5,80),
+RANGE = {"mcap":(800,12000),"kospi":(300,20000),"demand":(200,2000),"time":(400,3000),"hhloan":(600,2500),"otherloan":(80,1200),"futoi":(10,800),"levetf":(2,200),"els":(1,150),"nbloan":(80,900),"mmf":(30,400),"stockfund":(20,500),"ovsderiv":(30,2000),"dls":(0.5,80),"cfdbuy":(0.3,30),"cfdsell":(0.02,20),
          "yetak":(5,400),"yungja":(1,120),"jiya":(1,120),"rp":(5,400),"misu":(0.05,20),"cma":(5,400)}
 def calibrate(key, raw_latest, unit_name):
     """先按单位字段换算, 若落在合理区间直接用; 否则在10的幂里找能落区间的档位"""
@@ -652,6 +653,93 @@ def fetch_funds_daily():
 
 # ---------------------------- 主流程 ----------------------------
 
+
+CFD_HIST_FILE = "cfd_history.json"
+CFD_BUDGET = 60   # 每轮最多解析的帖子数(新帖优先, 余量回填历史)
+
+def _cfd_pdf_totals(pdf_bytes, first_dump=False):
+    """解析종목별CFD PDF → (买入合计원, 卖出合计원); 结构写诊断"""
+    import pdfplumber, io
+    buy=sell=0.0; rows=0
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        if first_dump and pdf.pages:
+            t0 = (pdf.pages[0].extract_text() or "")[:400]
+            dbg("CFD PDF首页样本: " + t0.replace("\n"," | ")[:380])
+        for pg in pdf.pages:
+            for tb in (pg.extract_tables() or []):
+                for r in tb:
+                    if not r or len(r)<3: continue
+                    nums=[]
+                    for cell in r:
+                        c=str(cell or "").replace(",","").replace(" ","")
+                        try: nums.append(float(c))
+                        except ValueError: nums.append(None)
+                    vals=[n for n in nums if n is not None and n>0]
+                    txt="".join(str(c or "") for c in r)
+                    if "합계" in txt and len(vals)>=2:
+                        return vals[-2], vals[-1]   # 合计行: 倒数两列=买/卖
+                    if len(vals)>=2 and any(n is None for n in nums[:1]):
+                        buy+=vals[-2]; sell+=vals[-1]; rows+=1
+    if rows==0: return None, None
+    return buy, sell
+
+def fetch_cfd():
+    print("· CFD余额(협회公告板 PDF, 国内·多空)…", flush=True)
+    try:
+        hist = json.load(open(CFD_HIST_FILE)) if os.path.exists(CFD_HIST_FILE) else {}
+    except Exception:
+        hist = {}
+    ses = requests.Session()
+    ses.headers.update({"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    kofia = "https://www.kofia.or.kr"
+    # 最新seq
+    try:
+        blist = ses.get(kofia+"/brd/m_198/list.do", timeout=20).text
+        seqs = sorted({int(x) for x in re.findall(r"seq=(\d+)", blist) if int(x)>5}, reverse=True)
+        latest = seqs[0] if seqs else None
+    except Exception as e:
+        dbg(f"CFD板列表失败 {str(e)[:80]}"); latest=None
+    if not latest:
+        return _cfd_emit(hist)
+    done = {int(v["seq"]) for v in hist.values() if "seq" in v}
+    todo = [q for q in range(latest, 9, -1) if q not in done][:CFD_BUDGET]
+    dbg(f"CFD进度: 已存{len(hist)}日, 最新seq={latest}, 本轮处理{len(todo)}帖")
+    first = not hist
+    for q in todo:
+        try:
+            view = ses.get(kofia+f"/brd/m_198/view.do?seq={q}", timeout=20).text
+            m = re.search(r'(down\.do\?[^"\']+)', view)
+            fn = re.search(r'종목별CFD(\d{4}-\d{2}-\d{2})', view)
+            if not m or not fn: dbg(f"CFD seq{q} 无附件/日期"); continue
+            date = fn.group(1)
+            url = kofia + "/brd/m_198/" + m.group(1).replace("&amp;","&")
+            pdf = ses.get(url, timeout=40).content
+            if len(pdf) < 2000: dbg(f"CFD seq{q} 附件过小{len(pdf)}"); continue
+            b, sl = _cfd_pdf_totals(pdf, first_dump=first)
+            first = False
+            if b is None: dbg(f"CFD seq{q} {date} 解析无行"); continue
+            hist[date] = {"seq": q, "buy": b, "sell": sl}
+            time.sleep(0.4)
+        except Exception as e:
+            dbg(f"CFD seq{q} 异常 {str(e)[:90]}")
+    try:
+        json.dump(hist, open(CFD_HIST_FILE,"w"), ensure_ascii=False)
+    except Exception as e:
+        dbg(f"CFD历史写入失败 {e}")
+    return _cfd_emit(hist)
+
+def _cfd_emit(hist):
+    if not hist: return {}
+    dd = sorted(hist)
+    braw=[hist[d]["buy"] for d in dd]; sraw=[hist[d]["sell"] for d in dd]
+    sb = calibrate("cfdbuy", braw[-1], "원")
+    ss = calibrate("cfdsell", sraw[-1], "원") or sb
+    if sb is None: dbg(f"CFD数量级异常 buy={braw[-1]}"); return {}
+    out = {"cfdbuy":{"d":dd,"v":[round(x*sb,3) for x in braw],"f":"D","src":"협회 종목별CFD잔고 국내 매수합계"},
+           "cfdsell":{"d":dd,"v":[round(x*ss,3) for x in sraw],"f":"D","src":"협회 종목별CFD잔고 국내 매도합계"}}
+    print(f"  ✓ CFD {len(dd)}日 ({dd[0]}~{dd[-1]}) 买{out['cfdbuy']['v'][-1]:,.2f}T / 卖{out['cfdsell']['v'][-1]:,.2f}T")
+    return out
+
 def scout_cfd():
     """FreeSIS侦察: 定位CFD统计的内部数据端点, 结果全部写入诊断供远程分析"""
     print("· CFD侦察(FreeSIS 협회통계)…", flush=True)
@@ -735,8 +823,8 @@ def main():
     except Exception as e: print(f"  ✗ ECOS协会月频失败: {e}")
     out["funds"]=funds
     out["deriv"] = fetch_deriv()
-    try: scout_cfd()
-    except Exception as e: dbg(f"scout_cfd顶层 {str(e)[:100]}")
+    try: out["deriv"].update(fetch_cfd())
+    except Exception as e: dbg(f"fetch_cfd顶层 {str(e)[:100]}")
 
     print("\n========== 序列体检报告 ==========")
     def rep(k,v):
@@ -744,7 +832,7 @@ def main():
         else: print(f"  {k:8s} 缺失")
     rep("mcap",out.get("mcap")); rep("kospi",out.get("kospi")); rep("demand",out.get("demand")); rep("time",out.get("time")); rep("hhloan",out.get("hhloan")); rep("nbloan",out.get("nbloan")); rep("otherloan",out.get("otherloan"))
     for k in ("yetak","yungja","jiya","rp","misu","cma","forced"): rep(k,(out.get("funds") or {}).get(k))
-    for k in ("futoi","levetf","els","dls","mmf","stockfund"): rep(k,(out.get("deriv") or {}).get(k))
+    for k in ("futoi","levetf","els","dls","mmf","stockfund","cfdbuy","cfdsell"): rep(k,(out.get("deriv") or {}).get(k))
     print("==================================\n")
     with open("data.js","w",encoding="utf-8") as f:
         f.write("window.KOREA_DATA=");json.dump(out,f,ensure_ascii=False,separators=(",",":"));f.write(";")
