@@ -651,6 +651,69 @@ def fetch_funds_daily():
     return out
 
 # ---------------------------- 主流程 ----------------------------
+
+def scout_cfd():
+    """FreeSIS侦察: 定位CFD统计的内部数据端点, 结果全部写入诊断供远程分析"""
+    print("· CFD侦察(FreeSIS 협회통계)…", flush=True)
+    ses = requests.Session()
+    ses.headers.update({"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                        "Accept-Language":"ko,en;q=0.8"})
+    base = "https://freesis.kofia.or.kr"
+    def grab(url, method="GET", payload=None, tag=""):
+        try:
+            r = ses.post(url, json=payload, timeout=20) if method=="POST" else ses.get(url, timeout=20)
+            body = r.text or ""
+            dbg(f"CFD侦察[{tag}] {method} {url} → HTTP{r.status_code} len={len(body)} CT={r.headers.get('content-type','')[:40]}")
+            return body
+        except Exception as e:
+            dbg(f"CFD侦察[{tag}] {url} 异常 {str(e)[:100]}"); return ""
+    # 1) 首页: 提取端点与菜单结构
+    home = grab(base+"/", tag="home")
+    if home:
+        endpoints = sorted(set(re.findall(r'["\'/]((?:[\w\-]+/)*[\w\-]+\.do)', home)))[:20]
+        dbg("CFD侦察[home端点] " + ", ".join(endpoints))
+        js = sorted(set(re.findall(r'src=["\']([^"\']+\.js[^"\']*)', home)))[:10]
+        dbg("CFD侦察[home脚本] " + ", ".join(js))
+        for kw in ("CFD","차액결제"):
+            hits = [m.start() for m in re.finditer(kw, home)]
+            if hits:
+                i = hits[0]
+                dbg(f"CFD侦察[home含{kw}] 上下文: " + home[max(0,i-120):i+180].replace("\n"," ")[:280])
+    # 2) 已确认的FreeSIS统计框架入口(serviceId寻址模式)
+    probes = [
+        ("GET", base+"/stat/FreeSIS.do?parentDivId=MSIS10000000000000", None, "统计主框架"),
+        ("GET", base+"/stat/FreeSIS.do?parentDivId=MSIS10000000000000&serviceId=STATSCU0100000070", None, "信用供与页(参照)"),
+        ("GET", base+"/meta/getMetaMenuList.do", None, "menuGET"),
+        ("GET", base+"/sitemap.do", None, "sitemap"),
+    ]
+    # B路线: 협会官网CFD잔고동향公告板(日度帖子, 顺序seq, 附件为逐日数据表)
+    kofia = "https://www.kofia.or.kr"
+    blist = grab(kofia+"/brd/m_198/list.do", tag="B板列表")
+    if blist:
+        seqs = re.findall(r"seq=(\d+)", blist)[:12]
+        dbg("CFD侦察[B板seq样本] " + ", ".join(seqs))
+        titles = re.findall(r"CFD[^<\n]{0,60}", blist)[:6]
+        dbg("CFD侦察[B板标题样本] " + " | ".join(t.strip()[:60] for t in titles))
+        if seqs:
+            view = grab(kofia+f"/brd/m_198/view.do?seq={seqs[0]}", tag="B板最新帖")
+            if view:
+                atts = sorted(set(re.findall(r'(?:href|src)=["\']([^"\']*(?:download|atch|file|Down)[^"\']*)', view, re.I)))[:8]
+                dbg("CFD侦察[B板附件链接] " + " | ".join(atts))
+                exts = sorted(set(re.findall(r'([\w%\-]+\.(?:xlsx?|pdf|csv|hwp))', view, re.I)))[:8]
+                dbg("CFD侦察[B板附件文件名] " + ", ".join(exts))
+    for method,url,payload,tag in probes:
+        body = grab(url, method, payload, tag)
+        if not body: continue
+        sids = sorted(set(re.findall(r'serviceId=([A-Z0-9]+)', body)))[:30]
+        if sids: dbg(f"CFD侦察[{tag} serviceId清单] " + ", ".join(sids))
+        pids = sorted(set(re.findall(r'parentDivId=([A-Z0-9]+)', body)))[:15]
+        if pids: dbg(f"CFD侦察[{tag} 分区ID] " + ", ".join(pids))
+        frames = sorted(set(re.findall(r'(?:src|href)=["\']([^"\']+\.do[^"\']*)', body)))[:15]
+        if frames: dbg(f"CFD侦察[{tag} 框架页] " + ", ".join(frames))
+        for kw in ("CFD","차액결제","파생상품"):
+            i = body.find(kw)
+            if i>=0: dbg(f"CFD侦察[{tag}命中{kw}] " + body[max(0,i-160):i+260].replace("\n"," ").replace("\t"," ")[:380])
+
 def main():
     out={"meta":{"fetched_at":dt.datetime.now().strftime("%Y-%m-%d %H:%M"),"notes":[],"debug":DEBUG}}
     try:
@@ -672,6 +735,8 @@ def main():
     except Exception as e: print(f"  ✗ ECOS协会月频失败: {e}")
     out["funds"]=funds
     out["deriv"] = fetch_deriv()
+    try: scout_cfd()
+    except Exception as e: dbg(f"scout_cfd顶层 {str(e)[:100]}")
 
     print("\n========== 序列体检报告 ==========")
     def rep(k,v):
